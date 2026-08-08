@@ -943,6 +943,117 @@ async function routePost(request, path) {
     }
   }
 
+  if (path === 'broker/kite/exit-position') {
+    // Close an existing position with a MARKET order in the opposite direction.
+    // Body: { tradingsymbol, product, quantity?, exchange? }
+    try {
+      const { tradingsymbol, product, quantity: qtyReq, exchange } = body;
+      if (!tradingsymbol || !product) return json({ ok: false, error: 'tradingsymbol and product required' }, 400);
+      const { kite } = await requireKite();
+
+      // Verify position exists and get its authoritative direction
+      const positions = await kite.getPositions();
+      const day = positions.day || [];
+      const pos = day.find((p) => p.tradingsymbol === tradingsymbol && p.product === product);
+      if (!pos || Number(pos.quantity) === 0) return json({ ok: false, error: 'No open position for this contract + product' }, 400);
+
+      const isLong = Number(pos.quantity) > 0;
+      const exitSide = isLong ? 'SELL' : 'BUY';
+      const qty = qtyReq ? Math.min(Math.abs(Number(qtyReq)), Math.abs(Number(pos.quantity))) : Math.abs(Number(pos.quantity));
+
+      const params = {
+        exchange: exchange || pos.exchange || 'NFO',
+        tradingsymbol,
+        transaction_type: exitSide,
+        order_type: 'MARKET',
+        product,
+        quantity: qty,
+        validity: 'DAY',
+      };
+
+      const db = await getDb();
+      const ordersCol = db.collection('orders');
+      const idem = `exit-${tradingsymbol}-${product}-${Date.now()}`;
+      const ins = await ordersCol.insertOne({
+        idempotency_key: idem, broker: 'kite', status: 'SUBMITTING',
+        params, kind: 'EXIT', signal_ref: null, created_at: new Date(),
+      });
+
+      try {
+        const resp = await kite.placeOrder('regular', params);
+        await ordersCol.updateOne(
+          { _id: ins.insertedId },
+          { $set: { status: 'SUBMITTED', order_id: resp.order_id, broker_response: resp, submitted_at: new Date() } }
+        );
+        return json({ ok: true, order_id: resp.order_id, exited_qty: qty, side: exitSide, tradingsymbol });
+      } catch (e) {
+        await ordersCol.updateOne({ _id: ins.insertedId }, { $set: { status: 'FAILED', error: e.message, failed_at: new Date() } });
+        return json({ ok: false, error: e.message }, 500);
+      }
+    } catch (e) {
+      return json({ ok: false, error: e.message }, 500);
+    }
+  }
+
+  if (path === 'broker/kite/place-stop') {
+    // Place a stop-loss order (SL-M by default) for an EXISTING position.
+    // Body: { tradingsymbol, product, trigger_price, quantity?, exchange?, order_type?, price? }
+    try {
+      const { tradingsymbol, product, trigger_price, quantity: qtyReq, exchange, order_type, price } = body;
+      if (!tradingsymbol || !product || !trigger_price) return json({ ok: false, error: 'tradingsymbol, product, trigger_price required' }, 400);
+      const trig = Number(trigger_price);
+      if (!Number.isFinite(trig) || trig <= 0) return json({ ok: false, error: 'invalid trigger_price' }, 400);
+
+      const { kite } = await requireKite();
+      const positions = await kite.getPositions();
+      const day = positions.day || [];
+      const pos = day.find((p) => p.tradingsymbol === tradingsymbol && p.product === product);
+      if (!pos || Number(pos.quantity) === 0) return json({ ok: false, error: 'No open position — nothing to protect' }, 400);
+
+      const isLong = Number(pos.quantity) > 0;
+      const exitSide = isLong ? 'SELL' : 'BUY';
+      const qty = qtyReq ? Math.min(Math.abs(Number(qtyReq)), Math.abs(Number(pos.quantity))) : Math.abs(Number(pos.quantity));
+      const ot = (order_type || 'SL-M').toUpperCase();
+
+      const params = {
+        exchange: exchange || pos.exchange || 'NFO',
+        tradingsymbol,
+        transaction_type: exitSide,
+        order_type: ot,
+        product,
+        quantity: qty,
+        trigger_price: trig,
+        validity: 'DAY',
+      };
+      if (ot === 'SL') {
+        if (!price) return json({ ok: false, error: 'SL (limit-stop) order requires price' }, 400);
+        params.price = Number(price);
+      }
+
+      const db = await getDb();
+      const ordersCol = db.collection('orders');
+      const idem = `stop-${tradingsymbol}-${trig}-${Date.now()}`;
+      const ins = await ordersCol.insertOne({
+        idempotency_key: idem, broker: 'kite', status: 'SUBMITTING',
+        params, kind: 'STOP_LOSS', created_at: new Date(),
+      });
+
+      try {
+        const resp = await kite.placeOrder('regular', params);
+        await ordersCol.updateOne(
+          { _id: ins.insertedId },
+          { $set: { status: 'SUBMITTED', order_id: resp.order_id, broker_response: resp, submitted_at: new Date() } }
+        );
+        return json({ ok: true, order_id: resp.order_id, trigger_price: trig, side: exitSide, tradingsymbol });
+      } catch (e) {
+        await ordersCol.updateOne({ _id: ins.insertedId }, { $set: { status: 'FAILED', error: e.message, failed_at: new Date() } });
+        return json({ ok: false, error: e.message }, 500);
+      }
+    } catch (e) {
+      return json({ ok: false, error: e.message }, 500);
+    }
+  }
+
   if (path === 'ai/analyze') {
     const symbol = (body.symbol || 'NIFTY').toUpperCase();
     try {

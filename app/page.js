@@ -119,7 +119,161 @@ function usePositionsAndFunds(connected) {
   return { positions, funds, loading, err, lastAt, refresh: load }
 }
 
-function PositionsPanel({ positions, funds, loading, err, lastAt, onRefresh }) {
+function PositionActionModal({ open, onOpenChange, position, action, onDone }) {
+  const [busy, setBusy] = useState(false)
+  const [result, setResult] = useState(null)
+  const [triggerPrice, setTriggerPrice] = useState('')
+  const [orderType, setOrderType] = useState('SL-M')
+  const [limitPrice, setLimitPrice] = useState('')
+
+  useEffect(() => {
+    if (open && position && action === 'STOP') {
+      // Suggest a stop 25% below/above LTP based on direction
+      const isLong = Number(position.quantity) > 0
+      const ltp = Number(position.last_price) || Number(position.average_price) || 0
+      const suggested = isLong ? +(ltp * 0.75).toFixed(1) : +(ltp * 1.25).toFixed(1)
+      setTriggerPrice(String(suggested))
+      setOrderType('SL-M')
+      setLimitPrice('')
+      setResult(null)
+    } else if (open) {
+      setResult(null)
+    }
+  }, [open, position, action])
+
+  if (!position) return null
+  const isLong = Number(position.quantity) > 0
+  const qty = Math.abs(Number(position.quantity))
+  const ltp = Number(position.last_price) || 0
+  const avg = Number(position.average_price) || 0
+  const pnl = Number(position.pnl) || 0
+  const exitSide = isLong ? 'SELL' : 'BUY'
+  const isExit = action === 'EXIT'
+
+  async function submit() {
+    setBusy(true); setResult(null)
+    try {
+      const url = isExit ? '/api/broker/kite/exit-position' : '/api/broker/kite/place-stop'
+      const payload = isExit
+        ? { tradingsymbol: position.tradingsymbol, product: position.product, exchange: position.exchange }
+        : { tradingsymbol: position.tradingsymbol, product: position.product, exchange: position.exchange,
+            trigger_price: Number(triggerPrice), order_type: orderType,
+            price: orderType === 'SL' ? Number(limitPrice) : undefined }
+      const r = await fetch(url, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+      const j = await r.json()
+      if (j.ok) {
+        setResult({ ok: true, ...j })
+        toast.success(`${isExit ? 'Exit' : 'Stop-loss'} placed · ID ${j.order_id}`, { duration: 6000 })
+        onDone?.(j)
+      } else {
+        setResult({ ok: false, error: j.error })
+        toast.error(`${isExit ? 'Exit' : 'Stop'} failed: ${j.error}`)
+      }
+    } catch (e) { setResult({ ok: false, error: e.message }); toast.error(e.message) }
+    finally { setBusy(false) }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="bg-slate-950 border-slate-800 text-slate-100 max-w-md">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2 text-lg">
+            {isExit ? <><XCircle className="w-5 h-5 text-rose-400" /> Exit Position</>
+                    : <><ShieldAlert className="w-5 h-5 text-amber-400" /> Set Stop-Loss</>}
+          </DialogTitle>
+          <DialogDescription className="text-slate-400 text-xs">
+            {isExit
+              ? <>This will place a <span className="text-rose-300 font-semibold">{exitSide} MARKET order</span> to close your position immediately.</>
+              : <>This will place a <span className="text-amber-300 font-semibold">{exitSide} SL-M order</span> that fires only when price crosses your trigger.</>}
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="bg-slate-900 border border-slate-800 rounded p-3 space-y-1 font-mono text-xs">
+          <div className="flex items-center justify-between">
+            <span className="text-slate-500">Contract</span>
+            <span className="text-slate-100 font-semibold">{position.tradingsymbol}</span>
+          </div>
+          <div className="flex items-center justify-between">
+            <span className="text-slate-500">Position</span>
+            <span className={isLong ? 'text-emerald-300' : 'text-rose-300'}>{isLong ? 'LONG' : 'SHORT'} {qty} · {position.product}</span>
+          </div>
+          <div className="flex items-center justify-between">
+            <span className="text-slate-500">Avg / LTP</span>
+            <span>₹{fmt(avg, 1)} → ₹{fmt(ltp, 1)}</span>
+          </div>
+          <div className="flex items-center justify-between">
+            <span className="text-slate-500">Current P&amp;L</span>
+            <span className={pnl >= 0 ? 'text-emerald-400 font-bold' : 'text-rose-400 font-bold'}>{pnl >= 0 ? '+' : ''}₹{fmt(pnl, 0)}</span>
+          </div>
+        </div>
+
+        {isExit ? (
+          <div className="border border-rose-500/30 bg-rose-500/5 rounded p-3 space-y-1 text-xs font-mono">
+            <div className="text-rose-300 font-semibold">You will {exitSide} {qty} @ MARKET</div>
+            <div className="text-slate-500">Realises current P&amp;L of ≈ <span className={pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}>₹{fmt(pnl, 0)}</span> instantly. No stop, no target — full close.</div>
+          </div>
+        ) : (
+          <div className="space-y-2">
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="text-[10px] uppercase tracking-widest text-slate-500">Trigger Price ₹</label>
+                <Input type="number" step="0.05" value={triggerPrice} onChange={e => setTriggerPrice(e.target.value)} className="bg-slate-900 border-slate-800 text-slate-100 h-9 font-mono" />
+                <div className="text-[10px] font-mono text-slate-500 mt-1">
+                  {isLong ? 'below' : 'above'} current ₹{fmt(ltp, 1)} · Δ ≈ ₹{fmt(Math.abs(ltp - Number(triggerPrice || 0)), 1)}
+                </div>
+              </div>
+              <div>
+                <label className="text-[10px] uppercase tracking-widest text-slate-500">Order Type</label>
+                <div className="flex gap-1 mt-1">
+                  {['SL-M', 'SL'].map(t => (
+                    <button key={t} onClick={() => setOrderType(t)}
+                      className={`flex-1 h-9 rounded text-xs font-mono font-semibold border ${orderType === t ? 'bg-amber-500 text-slate-950 border-amber-500' : 'bg-slate-900 border-slate-800 text-slate-400'}`}
+                    >{t}</button>
+                  ))}
+                </div>
+                <div className="text-[10px] font-mono text-slate-500 mt-1">{orderType === 'SL-M' ? 'Market on trigger' : 'Limit on trigger'}</div>
+              </div>
+              {orderType === 'SL' && (
+                <div className="col-span-2">
+                  <label className="text-[10px] uppercase tracking-widest text-slate-500">Limit Price ₹</label>
+                  <Input type="number" step="0.05" value={limitPrice} onChange={e => setLimitPrice(e.target.value)} className="bg-slate-900 border-slate-800 text-slate-100 h-9 font-mono" />
+                </div>
+              )}
+            </div>
+            <div className="border border-amber-500/30 bg-amber-500/5 rounded p-2 text-xs font-mono text-amber-200">
+              Est. worst-case loss if triggered: <span className="font-bold">≈ ₹{fmt(Math.abs((Number(triggerPrice || 0) - avg) * qty), 0)}</span>
+            </div>
+          </div>
+        )}
+
+        {result && (
+          <div className={`p-2 rounded text-xs font-mono ${result.ok ? 'bg-emerald-500/10 border border-emerald-500/30 text-emerald-200' : 'bg-rose-500/10 border border-rose-500/30 text-rose-200'}`}>
+            {result.ok ? `✓ Order ID: ${result.order_id}` : `✗ ${result.error}`}
+          </div>
+        )}
+
+        <DialogFooter className="gap-2">
+          <Button variant="outline" className="border-slate-700 text-slate-300" onClick={() => onOpenChange(false)} disabled={busy}>
+            {result?.ok ? 'Close' : 'Cancel'}
+          </Button>
+          {!result?.ok && (
+            <Button onClick={submit} disabled={busy || (!isExit && !triggerPrice)}
+              className={`font-bold ${isExit ? 'bg-rose-500 hover:bg-rose-400 text-slate-950' : 'bg-amber-500 hover:bg-amber-400 text-slate-950'}`}
+            >
+              {busy ? <><Loader2 className="w-3.5 h-3.5 animate-spin mr-1.5" /> Placing…</> :
+                isExit ? <>CONFIRM EXIT · {exitSide} {qty}</> : <>PLACE STOP · trigger ₹{fmt(Number(triggerPrice || 0), 1)}</>}
+            </Button>
+          )}
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function PositionsPanel({ positions, funds, loading, err, lastAt, onRefresh, onAction }) {
   const day = positions?.day || []
   const openPositions = day.filter(p => p.quantity !== 0)
   const totalPnl = day.reduce((sum, p) => sum + (Number(p.pnl) || 0), 0)
@@ -195,6 +349,7 @@ function PositionsPanel({ positions, funds, loading, err, lastAt, onRefresh }) {
                 <th className="text-right px-1">Avg</th>
                 <th className="text-right px-1">LTP</th>
                 <th className="text-right px-1">P&amp;L</th>
+                <th className="text-right px-1">Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -214,6 +369,24 @@ function PositionsPanel({ positions, funds, loading, err, lastAt, onRefresh }) {
                     <td className={`px-1 text-right font-bold ${pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
                       {pnl >= 0 ? '+' : ''}{fmt(pnl, 0)}
                       <div className="text-[9px] text-slate-500">{pnl >= 0 ? '+' : ''}{fmt(pnlPct, 1)}%</div>
+                    </td>
+                    <td className="px-1 text-right">
+                      <div className="flex gap-1 justify-end">
+                        <button
+                          title="Set stop-loss order"
+                          onClick={() => onAction?.(p, 'STOP')}
+                          className="h-6 w-6 rounded border border-amber-500/40 bg-amber-500/10 hover:bg-amber-500/25 text-amber-400 flex items-center justify-center transition"
+                        >
+                          <ShieldAlert className="w-3 h-3" />
+                        </button>
+                        <button
+                          title="Exit position (market)"
+                          onClick={() => onAction?.(p, 'EXIT')}
+                          className="h-6 rounded border border-rose-500/40 bg-rose-500/10 hover:bg-rose-500/25 text-rose-400 flex items-center justify-center px-1.5 gap-1 text-[10px] font-bold transition"
+                        >
+                          <XCircle className="w-3 h-3" /> EXIT
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 )
@@ -960,6 +1133,7 @@ const App = () => {
   const { status: broker, refresh: refreshBroker } = useBrokerStatus()
   const { positions, funds, loading: posLoading, err: posErr, lastAt: posLastAt, refresh: refreshPositions } = usePositionsAndFunds(broker.connected)
   const [tradeModalOpen, setTradeModalOpen] = useState(false)
+  const [positionAction, setPositionAction] = useState({ open: false, position: null, action: null })
 
   // Handle ?broker=connected|failed on return from Kite OAuth
   useEffect(() => {
@@ -1192,6 +1366,7 @@ const App = () => {
                       positions={positions} funds={funds}
                       loading={posLoading} err={posErr} lastAt={posLastAt}
                       onRefresh={refreshPositions}
+                      onAction={(pos, action) => setPositionAction({ open: true, position: pos, action })}
                     />
                   )}
                   <SignalHistoryPanel rows={historyRows} />
@@ -1229,6 +1404,14 @@ const App = () => {
         signal={activeResult?.best || null}
         brokerConnected={broker.connected}
         onOrderPlaced={() => { setTimeout(refreshPositions, 3000) }}
+      />
+
+      <PositionActionModal
+        open={positionAction.open}
+        onOpenChange={(o) => setPositionAction((s) => ({ ...s, open: o }))}
+        position={positionAction.position}
+        action={positionAction.action}
+        onDone={() => { setTimeout(refreshPositions, 2000) }}
       />
     </div>
   )
