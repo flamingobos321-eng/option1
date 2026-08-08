@@ -334,3 +334,56 @@ agent_communication:
         validation is working, and optional context injection still functions as expected.
         
         The critical fix has been verified and is production-ready.
+
+# ==================== v0.2 — REAL-TIME SIGNAL ENGINE + AUTO TRADE WATCH ====================
+
+backend_v0_2:
+  - task: "GET /api/signal/scan — deterministic multi-market signal engine"
+    implemented: true
+    working: true
+    file: "/app/app/api/[[...path]]/route.js"
+    comment: |
+      Evaluates 10 candidates per symbol (5 strikes × CE/PE) with fixed 100-point rubric:
+      Trend 20, Momentum 15, VWAP-proxy 10, Volume 10, OI 15, PCR 5, IV(via VIX) 10, Liq 5, R:R 10.
+      Scans NIFTY / BANKNIFTY / FINNIFTY in parallel, returns per-symbol best + ranked +
+      bestOverall. Priority: VERY_STRONG ≥90, STRONG ≥80, MODERATE ≥75, else NO_TRADE.
+      Computes entry zone (LTP±3%), stop (0.75×LTP), targets (1.5× / 2.0×), max loss per lot
+      with correct lot sizes (75/15/40), invalidation text, warnings. Reasoning bullets are
+      deterministically generated from the score breakdown — NO LLM in the decision loop.
+      Verified live: NIFTY BUY PE 24500 @ 88/100 STRONG, BANKNIFTY BUY PE 57800 @ 85/100 STRONG,
+      FINNIFTY 26400 PE @ 74/100 NO_TRADE.
+
+  - task: "GET /api/signal/history — signal timeline persisted to MongoDB"
+    implemented: true
+    working: true
+    file: "/app/app/api/[[...path]]/route.js"
+    comment: |
+      Collection `signal_history`. On each scan persistSignals() inserts a new row when the
+      contract key (symbol-side-strike) changes OR score delta ≥5; otherwise updates the last
+      row's status transition (NEW → ACTIVE → STRENGTHENING/WEAKENING → INVALIDATED).
+      Verified: 3 rows written on first scan.
+
+frontend_v0_2:
+  - task: "Real-time TRADE NOW card, opportunity rail, Auto Trade Watch, signal history"
+    implemented: true
+    working: true
+    file: "/app/app/page.js"
+    comment: |
+      Priority-styled card (🔥 VERY_STRONG / 🟢 STRONG / 🟡 MODERATE / ⛔ NO_TRADE), BUY CE/PE
+      pill, huge score, 8 metric boxes (entry/stop/T1/T2/maxLoss/lotSize/RR/confidence), 7-bullet
+      reasoning, invalidation, 9-component score breakdown, disabled PLACE TRADE with "P2 · Broker"
+      badge, "Explain via AI" (Claude), "Copy JSON". Opportunity rail with 3 ranked cards.
+      Auto Trade Watch switch — when ON polls /api/signal/scan every 3 min and fires a browser
+      Notification (dedup by contract key) + sonner toast on any TRADE signal with score ≥75.
+      Signal history panel on the side. Full screenshot verified.
+
+agent_communication_v0_2:
+    - agent: "main"
+      message: |
+        v0.2 delivered: real-time decision engine + auto watch. The Copilot dashboard now
+        actively decides BUY CE / BUY PE / NO TRADE per symbol with concrete entry/stop/targets,
+        multi-market ranking, priority buckets, and browser notifications on new setups.
+        NEXT STEP (blocked on user input): Broker Connect. User must choose broker (Zerodha
+        Kite / Upstox / Angel One SmartAPI) and provide API key + secret. Only then can PLACE
+        TRADE be wired to real orders — currently intentionally disabled with "P2 · Broker" badge.
+

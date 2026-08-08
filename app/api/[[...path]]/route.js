@@ -219,6 +219,299 @@ async function getOptionChain(symbol) {
   };
 }
 
+// ------------- SIGNAL ENGINE (deterministic) -------------
+const LOT_SIZES = { NIFTY: 75, BANKNIFTY: 15, FINNIFTY: 40 };
+const INDEX_TICK_KEY = { NIFTY: 'NIFTY 50', BANKNIFTY: 'NIFTY BANK', FINNIFTY: 'NIFTY FIN SERVICE' };
+
+function inferStep(rows) {
+  const s = [];
+  for (let i = 1; i < Math.min(rows.length, 25); i++) {
+    const d = rows[i].strikePrice - rows[i - 1].strikePrice;
+    if (d > 0) s.push(d);
+  }
+  s.sort((a, b) => a - b);
+  return s[Math.floor(s.length / 2)] || 50;
+}
+function median(arr) {
+  const a = arr.filter((x) => Number.isFinite(x) && x > 0).sort((x, y) => x - y);
+  if (!a.length) return 0;
+  return a[Math.floor(a.length / 2)];
+}
+
+function scoreCandidate({ side, strike, chain, indexTick, vixTick, step, lotSize }) {
+  const { spot, atm, pcr, maxPain, walls, rows } = chain;
+  const row = rows.find((r) => r.strikePrice === strike);
+  if (!row) return null;
+  const leg = side === 'CE' ? row.CE : row.PE;
+  if (!leg || !leg.lastPrice || leg.lastPrice < 1) return null;
+
+  const atmIdx = rows.findIndex((r) => r.strikePrice === atm);
+  const nearRows = rows.slice(Math.max(0, atmIdx - 4), Math.min(rows.length, atmIdx + 5));
+  const medVol = median(nearRows.map((r) => (side === 'CE' ? r.CE?.totalTradedVolume : r.PE?.totalTradedVolume) || 0));
+  const medOi = median(nearRows.map((r) => (side === 'CE' ? r.CE?.openInterest : r.PE?.openInterest) || 0));
+  const legVol = leg.totalTradedVolume || 0;
+  const legOi = leg.openInterest || 0;
+  const chgPct = indexTick?.percentChange || 0;
+
+  const bull = [spot > (maxPain || spot), pcr != null && pcr > 1.1, chgPct > 0.1].filter(Boolean).length;
+  const bear = [spot < (maxPain || spot), pcr != null && pcr < 0.9, chgPct < -0.1].filter(Boolean).length;
+
+  const b = {};
+  // Trend (20)
+  b.trend = side === 'CE'
+    ? (bull >= 2 ? 20 : bull === 1 ? 12 : 4)
+    : (bear >= 2 ? 20 : bear === 1 ? 12 : 4);
+
+  // Momentum (15)
+  const abs = Math.abs(chgPct);
+  const momOk = (side === 'CE' && chgPct > 0) || (side === 'PE' && chgPct < 0);
+  b.momentum = momOk ? Math.min(15, Math.round(5 + abs * 12)) : Math.max(2, Math.round(6 - abs * 5));
+
+  // VWAP proxy (10) — pivot = (H+L+C)/3 when intraday range known
+  const H = indexTick?.high, L = indexTick?.low;
+  let vwapOk = null;
+  if (H && L) {
+    const pivot = (H + L + spot) / 3;
+    const above = spot >= pivot;
+    vwapOk = (side === 'CE' && above) || (side === 'PE' && !above);
+    b.vwap = vwapOk ? 10 : 3;
+  } else b.vwap = 5;
+
+  // Volume (10)
+  const vr = medVol > 0 ? legVol / medVol : 0;
+  b.volume = vr >= 2 ? 10 : vr >= 1 ? 7 : vr >= 0.5 ? 4 : 2;
+
+  // OI (15)
+  let oi = 0;
+  const resDist = (walls.resistance.strike ?? spot) - spot;
+  const supDist = spot - (walls.support.strike ?? spot);
+  if (side === 'CE') {
+    if (resDist > step && resDist <= step * 4) oi += 10;
+    else if (resDist > step * 4) oi += 6;
+    else if (resDist > 0) oi += 4;
+    if (walls.support.oi > medOi * 1.8) oi += 5;
+  } else {
+    if (supDist > step && supDist <= step * 4) oi += 10;
+    else if (supDist > step * 4) oi += 6;
+    else if (supDist > 0) oi += 4;
+    if (walls.resistance.oi > medOi * 1.8) oi += 5;
+  }
+  b.oi = Math.min(15, oi);
+
+  // PCR (5)
+  if (pcr == null) b.pcr = 2;
+  else if (side === 'CE') b.pcr = pcr >= 1.0 && pcr <= 1.4 ? 5 : pcr > 0.9 ? 3 : 1;
+  else b.pcr = pcr >= 0.6 && pcr <= 0.9 ? 5 : pcr < 1.0 ? 3 : 1;
+
+  // IV proxy via VIX (10) — low VIX = cheap premium = good for long premium buy
+  const vix = vixTick?.last;
+  if (vix == null) b.iv = 5;
+  else if (vix < 13) b.iv = 10;
+  else if (vix < 16) b.iv = 7;
+  else if (vix < 20) b.iv = 4;
+  else b.iv = 2;
+
+  // Liquidity (5)
+  const liq = (legOi > medOi * 1.5 ? 3 : legOi > medOi * 0.7 ? 2 : 1) + (legVol > medVol ? 2 : legVol > 0 ? 1 : 0);
+  b.liquidity = Math.min(5, liq);
+
+  // R:R (10) — targets designed at 1:2, penalise if strike far OTM (thin premium)
+  const rrPenalty = Math.abs(strike - atm) / (step * 2);
+  b.rr = Math.max(4, Math.round(10 - rrPenalty * 2));
+
+  const total = Object.values(b).reduce((x, y) => x + y, 0);
+
+  // Trade parameters
+  const ltp = +leg.lastPrice;
+  const entryLow = +(ltp * 0.97).toFixed(1);
+  const entryHigh = +(ltp * 1.03).toFixed(1);
+  const stop = +(ltp * 0.75).toFixed(1);
+  const target1 = +(ltp * 1.5).toFixed(1);
+  const target2 = +(ltp * 2.0).toFixed(1);
+  const maxLoss = Math.round((ltp - stop) * lotSize);
+  const rr = ((target1 - ltp) / (ltp - stop));
+  const invalidation = side === 'CE'
+    ? `${chain.symbol} closes below ${walls.support.strike}`
+    : `${chain.symbol} closes above ${walls.resistance.strike}`;
+
+  // Deterministic reasoning bullets
+  const reasoning = [];
+  if (b.trend >= 15) reasoning.push(`${side === 'CE' ? 'Bullish' : 'Bearish'} bias: spot ${spot} ${side === 'CE' ? 'above' : 'below'} Max Pain ${maxPain}, PCR ${pcr}`);
+  else if (b.trend >= 10) reasoning.push(`Mild ${side === 'CE' ? 'bullish' : 'bearish'} bias from Max Pain / PCR mix`);
+  if (b.momentum >= 10) reasoning.push(`Index momentum ${chgPct >= 0 ? '+' : ''}${chgPct.toFixed(2)}% aligns with ${side}`);
+  if (vwapOk === true) reasoning.push(`Spot ${side === 'CE' ? 'above' : 'below'} intraday pivot — direction confirmed`);
+  if (b.volume >= 7) reasoning.push(`Volume expansion at ${strike} ${side} (${legVol.toLocaleString('en-IN')} contracts)`);
+  if (b.oi >= 10) reasoning.push(side === 'CE'
+    ? `Room to ${walls.resistance.strike} resistance (${(resDist).toFixed(0)} pts); Put wall ${walls.support.strike} anchors downside`
+    : `Room to ${walls.support.strike} support (${(supDist).toFixed(0)} pts); Call wall ${walls.resistance.strike} caps upside`);
+  if (b.pcr >= 4) reasoning.push(`PCR ${pcr} sits in ${side === 'CE' ? 'bullish' : 'bearish'} sweet spot`);
+  if (b.iv >= 7) reasoning.push(`India VIX ${vix?.toFixed?.(2)} — premium not expensive for long ${side}`);
+  else if (b.iv <= 3) reasoning.push(`⚠ India VIX ${vix?.toFixed?.(2)} — premium elevated`);
+  if (b.liquidity >= 4) reasoning.push(`Good liquidity — OI ${legOi.toLocaleString('en-IN')}, Vol ${legVol.toLocaleString('en-IN')}`);
+
+  const warnings = [];
+  if (legVol === 0) warnings.push('Zero volume this session — liquidity risk');
+  if (legOi < medOi * 0.3) warnings.push('OI is below median for this expiry — thin market');
+  if (ltp < 5) warnings.push('Premium too low — high theta bleed risk');
+  if (rr < 1.5) warnings.push(`R:R only 1:${rr.toFixed(1)} — below preferred 1:2`);
+
+  return {
+    symbol: chain.symbol, side, strike, expiry: chain.expiry,
+    strikeLabel: `${chain.symbol} ${strike} ${side}`,
+    ltp,
+    entry: { low: entryLow, high: entryHigh },
+    stop, target1, target2, maxLoss, lotSize,
+    riskReward: `1:${rr.toFixed(1)}`,
+    riskRewardNum: +rr.toFixed(2),
+    score: total, breakdown: b,
+    reasoning, warnings,
+    invalidation,
+    context: {
+      spot, atm, pcr, maxPain,
+      resistance: walls.resistance.strike, resistanceOi: walls.resistance.oi,
+      support: walls.support.strike, supportOi: walls.support.oi,
+      vix: vixTick?.last ?? null, indexChgPct: chgPct,
+    },
+    leg: { openInterest: legOi, volume: legVol },
+  };
+}
+
+function priorityOf(score) {
+  if (score >= 90) return 'VERY_STRONG';
+  if (score >= 80) return 'STRONG';
+  if (score >= 75) return 'MODERATE';
+  return 'NO_TRADE';
+}
+
+async function computeSignalForSymbol(symbol, indices) {
+  const chain = await getOptionChain(symbol);
+  const step = inferStep(chain.rows);
+  const atmIdx = chain.rows.findIndex((r) => r.strikePrice === chain.atm);
+  const lotSize = LOT_SIZES[symbol] || 1;
+  const indexTick = indices?.indices?.[INDEX_TICK_KEY[symbol]];
+  const vixTick = indices?.indices?.['INDIA VIX'];
+
+  const cands = [];
+  for (const off of [-2, -1, 0, 1, 2]) {
+    const idx = atmIdx + off;
+    if (idx < 0 || idx >= chain.rows.length) continue;
+    const strike = chain.rows[idx].strikePrice;
+    for (const side of ['CE', 'PE']) {
+      const c = scoreCandidate({ side, strike, chain, indexTick, vixTick, step, lotSize });
+      if (c) cands.push(c);
+    }
+  }
+  cands.sort((a, b) => b.score - a.score);
+  const best = cands[0] || null;
+  const priority = best ? priorityOf(best.score) : 'NO_TRADE';
+  const action = priority === 'NO_TRADE' ? 'NO_TRADE' : 'TRADE';
+
+  const noTradeReasons = [];
+  if (!best) noTradeReasons.push('No viable candidates found in near-ATM strikes');
+  else if (action === 'NO_TRADE') {
+    noTradeReasons.push(`Top score ${best.score}/100 is below 75 threshold`);
+    if (best.breakdown.trend < 10) noTradeReasons.push('Direction bias inconclusive');
+    if (best.breakdown.momentum < 8) noTradeReasons.push('Momentum too weak');
+    if (best.breakdown.oi < 8) noTradeReasons.push('No clear OI structure supports either side');
+    noTradeReasons.push(`Wait for underlying above ${chain.walls.resistance.strike} or below ${chain.walls.support.strike}`);
+  }
+
+  return {
+    symbol,
+    action, priority,
+    best,
+    alternatives: cands.slice(1, 4),
+    noTradeReasons,
+    chainSummary: {
+      spot: chain.spot, expiry: chain.expiry, atm: chain.atm,
+      pcr: chain.pcr, maxPain: chain.maxPain,
+      resistance: chain.walls.resistance, support: chain.walls.support,
+    },
+    indexTick: indexTick || null,
+    timestamp: new Date().toISOString(),
+  };
+}
+
+async function scanAll(symbols = ['NIFTY', 'BANKNIFTY', 'FINNIFTY']) {
+  const indices = await getIndices().catch(() => null);
+  const results = await Promise.allSettled(symbols.map((s) => computeSignalForSymbol(s, indices)));
+  const perSymbol = [];
+  const errors = [];
+  for (let i = 0; i < results.length; i++) {
+    const r = results[i];
+    if (r.status === 'fulfilled') perSymbol.push(r.value);
+    else errors.push({ symbol: symbols[i], error: r.reason?.message || String(r.reason) });
+  }
+  // Rank by best score across symbols (NO_TRADE => 0 for ranking)
+  const ranked = [...perSymbol].sort((a, b) => (b.best?.score || 0) - (a.best?.score || 0));
+  const bestOverall = ranked.find((r) => r.action === 'TRADE') || ranked[0] || null;
+
+  // Persist meaningful signals (score >= 60 or state change)
+  try { await persistSignals(perSymbol); } catch (e) { /* non-fatal */ }
+
+  return {
+    ok: true,
+    timestamp: new Date().toISOString(),
+    indices: indices?.indices || {},
+    perSymbol,
+    ranked,
+    bestOverall,
+    errors,
+  };
+}
+
+async function persistSignals(perSymbol) {
+  const db = await getDb();
+  const col = db.collection('signal_history');
+  const now = new Date();
+  for (const s of perSymbol) {
+    const key = s.best ? `${s.symbol}-${s.best.side}-${s.best.strike}` : `${s.symbol}-NO_TRADE`;
+    const score = s.best?.score || 0;
+    const prev = await col.findOne({ symbol: s.symbol }, { sort: { created_at: -1 } });
+
+    // Decide if we insert a new row (material change) or just update last one
+    let status = 'NEW';
+    let insertNew = true;
+    if (prev) {
+      const sameKey = prev.key === key;
+      const scoreDelta = Math.abs((prev.score || 0) - score);
+      if (sameKey && scoreDelta < 5) {
+        // No material change → update
+        insertNew = false;
+        if (score < 65 && (prev.score || 0) >= 75) status = 'WEAKENING';
+        else if (score >= 75) status = 'ACTIVE';
+        else status = prev.status || 'ACTIVE';
+        await col.updateOne({ _id: prev._id }, { $set: { updated_at: now, score, status } });
+      } else if (sameKey && scoreDelta >= 5) {
+        status = score > (prev.score || 0) ? 'STRENGTHENING' : 'WEAKENING';
+      } else {
+        // Different contract or NO_TRADE toggle
+        if (prev.action === 'TRADE') {
+          await col.updateOne({ _id: prev._id }, { $set: { status: 'INVALIDATED', updated_at: now } });
+        }
+        status = 'NEW';
+      }
+    }
+    if (insertNew) {
+      await col.insertOne({
+        key, symbol: s.symbol, action: s.action, priority: s.priority,
+        side: s.best?.side || null, strike: s.best?.strike || null, expiry: s.best?.expiry || null,
+        score, status,
+        best: s.best || null,
+        chainSummary: s.chainSummary,
+        created_at: now, updated_at: now,
+      });
+    }
+  }
+}
+
+async function getSignalHistory(limit = 20) {
+  const db = await getDb();
+  const col = db.collection('signal_history');
+  const rows = await col.find({}).sort({ created_at: -1 }).limit(limit).toArray();
+  return rows.map((r) => ({ ...r, _id: String(r._id) }));
+}
+
 // ------------- LLM -------------
 function getChat(sessionId, system) {
   if (!process.env.EMERGENT_LLM_KEY) throw new Error('Missing EMERGENT_LLM_KEY');
@@ -342,6 +635,28 @@ async function routeGet(request, path) {
       return json({ ok: true, data });
     } catch (e) {
       return json({ ok: false, error: e.message }, 502);
+    }
+  }
+
+  if (path === 'signal/scan') {
+    const sp = new URL(request.url).searchParams;
+    const symbolsParam = sp.get('symbols');
+    const symbols = symbolsParam ? symbolsParam.split(',').map((s) => s.trim().toUpperCase()) : ['NIFTY', 'BANKNIFTY', 'FINNIFTY'];
+    try {
+      const data = await scanAll(symbols);
+      return json(data);
+    } catch (e) {
+      return json({ ok: false, error: e.message }, 500);
+    }
+  }
+
+  if (path === 'signal/history') {
+    const limit = Math.min(50, +new URL(request.url).searchParams.get('limit') || 20);
+    try {
+      const rows = await getSignalHistory(limit);
+      return json({ ok: true, rows });
+    } catch (e) {
+      return json({ ok: false, error: e.message }, 500);
     }
   }
 

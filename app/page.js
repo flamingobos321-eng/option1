@@ -1,20 +1,22 @@
 'use client'
 
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import { Separator } from '@/components/ui/separator'
+import { Switch } from '@/components/ui/switch'
 import { toast } from 'sonner'
 import {
-  Activity, AlertTriangle, BarChart3, Bot, Brain, ChevronRight,
-  CircleDot, Gauge, LayoutDashboard, LineChart, ListOrdered, Loader2,
+  Activity, AlertTriangle, BarChart3, Bell, BellRing, Bot, Brain, ChevronRight,
+  CircleDot, Clock, Flame, Gauge, LayoutDashboard, LineChart, ListOrdered, Loader2,
   Radio, Send, Settings, ShieldAlert, Sparkles, TrendingDown, TrendingUp,
-  Wallet, Zap
+  Wallet, Zap, RefreshCw, XCircle
 } from 'lucide-react'
 
 const SYMBOLS = ['NIFTY', 'BANKNIFTY', 'FINNIFTY']
+const SCAN_INTERVAL_MS = 3 * 60 * 1000
 
 function fmt(n, d = 2) {
   if (n === null || n === undefined || Number.isNaN(n)) return '—'
@@ -28,53 +30,47 @@ function compact(n) {
   if (abs >= 1e3) return (n / 1e3).toFixed(1) + 'K'
   return String(n)
 }
-
-function useIndices() {
-  const [data, setData] = useState(null)
-  const [stale, setStale] = useState(false)
-  const [err, setErr] = useState(null)
-  useEffect(() => {
-    let alive = true
-    async function tick() {
-      try {
-        const r = await fetch('/api/market/indices', { cache: 'no-store' })
-        const j = await r.json()
-        if (!alive) return
-        if (j.ok) { setData(j); setStale(false); setErr(null) }
-        else { setStale(true); setErr(j.error) }
-      } catch (e) { setStale(true); setErr(e.message) }
-    }
-    tick()
-    const id = setInterval(tick, 15000)
-    return () => { alive = false; clearInterval(id) }
-  }, [])
-  return { data, stale, err }
+function timeAgo(iso) {
+  if (!iso) return '—'
+  const s = Math.floor((Date.now() - new Date(iso).getTime()) / 1000)
+  if (s < 60) return s + 's ago'
+  if (s < 3600) return Math.floor(s / 60) + 'm ago'
+  if (s < 86400) return Math.floor(s / 3600) + 'h ago'
+  return Math.floor(s / 86400) + 'd ago'
 }
 
-function useOptionChain(symbol) {
-  const [chain, setChain] = useState(null)
+// ---------- HOOKS ----------
+function useSignalScan() {
+  const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
   const [err, setErr] = useState(null)
-  const [tick, setTick] = useState(0)
-  useEffect(() => {
-    let alive = true
-    async function load() {
-      setLoading(true)
-      try {
-        const r = await fetch(`/api/market/option-chain?symbol=${symbol}`, { cache: 'no-store' })
-        const j = await r.json()
-        if (!alive) return
-        if (j.ok) { setChain(j.data); setErr(null) } else { setErr(j.error) }
-      } catch (e) { if (alive) setErr(e.message) }
-      finally { if (alive) setLoading(false) }
-    }
-    load()
-    const id = setInterval(() => setTick(t => t + 1), 30000)
-    return () => { alive = false; clearInterval(id) }
-  }, [symbol, tick])
-  return { chain, loading, err, refresh: () => setTick(t => t + 1) }
+  const [lastAt, setLastAt] = useState(null)
+  const load = useCallback(async () => {
+    setLoading(true)
+    try {
+      const r = await fetch('/api/signal/scan', { cache: 'no-store' })
+      const j = await r.json()
+      if (j.ok) { setData(j); setErr(null); setLastAt(new Date().toISOString()) }
+      else setErr(j.error || 'scan failed')
+    } catch (e) { setErr(e.message) } finally { setLoading(false) }
+  }, [])
+  useEffect(() => { load() }, [load])
+  return { data, loading, err, lastAt, refresh: load }
 }
 
+function useSignalHistory(tick) {
+  const [rows, setRows] = useState([])
+  useEffect(() => {
+    let alive = true
+    fetch('/api/signal/history?limit=25').then(r => r.json()).then(j => {
+      if (alive && j.ok) setRows(j.rows || [])
+    }).catch(() => {})
+    return () => { alive = false }
+  }, [tick])
+  return rows
+}
+
+// ---------- COMPONENTS ----------
 function IndexTile({ label, tick }) {
   const up = tick?.percentChange >= 0
   return (
@@ -111,10 +107,10 @@ function StatusPill({ label, state, color }) {
 
 function Sidebar({ active, onSelect }) {
   const items = [
-    { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
+    { id: 'signal', label: 'Trade Signal', icon: Flame },
     { id: 'chain', label: 'Option Chain', icon: BarChart3 },
-    { id: 'ai', label: 'AI Analysis', icon: Brain },
     { id: 'copilot', label: 'Copilot', icon: Bot },
+    { id: 'history', label: 'Signal Log', icon: Clock },
     { id: 'positions', label: 'Positions', icon: Wallet, locked: true },
     { id: 'orders', label: 'Orders', icon: ListOrdered, locked: true },
     { id: 'journal', label: 'Journal', icon: LineChart, locked: true },
@@ -129,7 +125,7 @@ function Sidebar({ active, onSelect }) {
         </div>
         <div>
           <div className="text-sm font-bold text-slate-100">OptionAI</div>
-          <div className="text-[9px] uppercase tracking-widest text-slate-500">Terminal · v0.1</div>
+          <div className="text-[9px] uppercase tracking-widest text-slate-500">Terminal · v0.2</div>
         </div>
       </div>
       <nav className="flex-1 px-2 py-3 space-y-1">
@@ -168,27 +164,273 @@ function Sidebar({ active, onSelect }) {
   )
 }
 
+function priorityStyle(priority) {
+  switch (priority) {
+    case 'VERY_STRONG': return {
+      wrap: 'border-emerald-400/60 bg-gradient-to-br from-emerald-500/10 to-teal-500/5 shadow-[0_0_50px_-15px_rgba(52,211,153,0.35)]',
+      label: '🔥 VERY STRONG', color: 'text-emerald-400', badge: 'bg-emerald-500 text-slate-950',
+    }
+    case 'STRONG': return {
+      wrap: 'border-emerald-500/40 bg-emerald-500/5',
+      label: '🟢 STRONG', color: 'text-emerald-400', badge: 'bg-emerald-500/90 text-slate-950',
+    }
+    case 'MODERATE': return {
+      wrap: 'border-amber-500/40 bg-amber-500/5',
+      label: '🟡 MODERATE', color: 'text-amber-400', badge: 'bg-amber-500/90 text-slate-950',
+    }
+    default: return {
+      wrap: 'border-slate-700 bg-slate-900/60',
+      label: '⛔ NO TRADE', color: 'text-slate-400', badge: 'bg-slate-700 text-slate-300',
+    }
+  }
+}
+
+function TradeSignalCard({ symbolResult, isBest, onExplain }) {
+  if (!symbolResult) return null
+  const { symbol, action, priority, best, noTradeReasons, chainSummary, indexTick } = symbolResult
+  const st = priorityStyle(priority)
+  const isTrade = action === 'TRADE' && best
+
+  return (
+    <Card className={`p-4 border-2 ${st.wrap} relative overflow-hidden`}>
+      {isBest && (
+        <Badge className="absolute top-3 right-3 bg-emerald-400 text-slate-950 font-bold text-[10px] tracking-widest">
+          ★ BEST OPPORTUNITY
+        </Badge>
+      )}
+      <div className="flex items-start justify-between mb-3">
+        <div className="flex items-center gap-3">
+          <div className={`text-xl font-bold ${st.color}`}>{st.label}</div>
+          <Badge variant="outline" className="border-slate-700 text-slate-400 font-mono text-[10px]">
+            {symbol} · spot {fmt(chainSummary?.spot)} {indexTick && `(${fmt(indexTick.percentChange)}%)`}
+          </Badge>
+        </div>
+        {best && (
+          <div className="text-right">
+            <div className="text-[9px] uppercase tracking-widest text-slate-500">Signal Score</div>
+            <div className={`text-3xl font-mono font-bold ${st.color}`}>{best.score}<span className="text-slate-600 text-base">/100</span></div>
+          </div>
+        )}
+      </div>
+
+      {isTrade ? (
+        <>
+          <div className="flex items-center gap-3 mb-4">
+            <Badge className={`text-lg font-bold px-4 py-2 ${best.side === 'CE' ? 'bg-emerald-500 text-slate-950' : 'bg-rose-500 text-slate-950'}`}>
+              BUY {best.side}
+            </Badge>
+            <div className="flex-1">
+              <div className="text-2xl font-bold text-slate-100 font-mono">{best.strikeLabel}</div>
+              <div className="text-xs text-slate-500 font-mono">Expiry: {best.expiry} · LTP ₹{fmt(best.ltp)}</div>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 font-mono mb-4">
+            <MetricBox label="Entry Zone" value={`₹${fmt(best.entry.low, 1)}–${fmt(best.entry.high, 1)}`} color="text-slate-100" />
+            <MetricBox label="Stop" value={`₹${fmt(best.stop, 1)}`} color="text-rose-400" />
+            <MetricBox label="Target 1" value={`₹${fmt(best.target1, 1)}`} color="text-emerald-400" />
+            <MetricBox label="Target 2" value={`₹${fmt(best.target2, 1)}`} color="text-emerald-400" />
+            <MetricBox label="Max Loss / lot" value={`₹${compact(best.maxLoss)}`} color="text-rose-300" small />
+            <MetricBox label="Lot Size" value={best.lotSize} color="text-slate-200" small />
+            <MetricBox label="Risk : Reward" value={best.riskReward} color="text-slate-100" small />
+            <MetricBox label="Confidence" value={priority === 'VERY_STRONG' ? 'HIGH' : priority === 'STRONG' ? 'HIGH' : 'MEDIUM'} color={st.color} small />
+          </div>
+
+          <div className="grid md:grid-cols-2 gap-3 mb-3">
+            <div>
+              <div className="text-[10px] uppercase tracking-widest text-slate-500 mb-1.5">Why This Trade</div>
+              <ul className="space-y-1 text-xs text-slate-300">
+                {best.reasoning.map((r, i) => (
+                  <li key={i} className="flex gap-2"><ChevronRight className="w-3 h-3 mt-0.5 text-emerald-400 shrink-0" />{r}</li>
+                ))}
+              </ul>
+            </div>
+            <div className="space-y-2">
+              <div>
+                <div className="text-[10px] uppercase tracking-widest text-slate-500 mb-1.5">Invalidation</div>
+                <div className="text-xs text-amber-300 bg-amber-500/5 border border-amber-500/20 rounded px-2 py-1.5 font-mono">
+                  {best.invalidation}
+                </div>
+              </div>
+              {best.warnings?.length > 0 && (
+                <div>
+                  <div className="text-[10px] uppercase tracking-widest text-slate-500 mb-1.5">Warnings</div>
+                  <ul className="space-y-1 text-xs text-rose-300">
+                    {best.warnings.map((w, i) => <li key={i} className="flex gap-2"><AlertTriangle className="w-3 h-3 mt-0.5 shrink-0" />{w}</li>)}
+                  </ul>
+                </div>
+              )}
+              <ScoreBreakdown breakdown={best.breakdown} />
+            </div>
+          </div>
+
+          <Separator className="bg-slate-800 my-3" />
+
+          <div className="flex flex-wrap items-center gap-2">
+            <Button className={`flex-1 min-w-[200px] text-slate-950 font-bold ${best.side === 'CE' ? 'bg-emerald-500 hover:bg-emerald-400' : 'bg-rose-500 hover:bg-rose-400'}`} disabled>
+              PLACE TRADE
+              <Badge variant="outline" className="ml-2 border-slate-950/40 text-slate-950 text-[9px]">P2 · Broker</Badge>
+            </Button>
+            <Button variant="outline" className="border-slate-700 text-slate-300" onClick={onExplain}>
+              <Brain className="w-3.5 h-3.5 mr-1.5" /> Explain via AI
+            </Button>
+            <Button variant="outline" className="border-slate-700 text-slate-300" onClick={() => navigator.clipboard.writeText(JSON.stringify(best, null, 2))}>
+              Copy JSON
+            </Button>
+          </div>
+        </>
+      ) : (
+        <div className="space-y-3">
+          <div className="text-sm text-slate-400">The signal engine did not find a setup above the 75/100 threshold for <span className="text-slate-200 font-semibold">{symbol}</span>.</div>
+          <ul className="space-y-1 text-xs text-slate-300">
+            {noTradeReasons.map((r, i) => (
+              <li key={i} className="flex gap-2"><ChevronRight className="w-3 h-3 mt-0.5 text-amber-400 shrink-0" />{r}</li>
+            ))}
+          </ul>
+          {best && (
+            <div className="text-[10px] font-mono text-slate-500 pt-1">
+              Highest-scored candidate (below threshold): {best.strikeLabel} · score {best.score}/100
+            </div>
+          )}
+        </div>
+      )}
+    </Card>
+  )
+}
+
+function MetricBox({ label, value, color, small }) {
+  return (
+    <div className={`border border-slate-800/60 rounded ${small ? 'px-2 py-1.5' : 'px-3 py-2'} bg-slate-950/40`}>
+      <div className="text-[9px] uppercase tracking-widest text-slate-500">{label}</div>
+      <div className={`${small ? 'text-sm' : 'text-lg'} font-mono font-bold ${color}`}>{value}</div>
+    </div>
+  )
+}
+
+function ScoreBreakdown({ breakdown }) {
+  const items = [
+    ['Trend', breakdown.trend, 20], ['Momentum', breakdown.momentum, 15],
+    ['VWAP', breakdown.vwap, 10], ['Volume', breakdown.volume, 10],
+    ['OI', breakdown.oi, 15], ['PCR', breakdown.pcr, 5],
+    ['IV', breakdown.iv, 10], ['Liq', breakdown.liquidity, 5], ['R:R', breakdown.rr, 10],
+  ]
+  return (
+    <div>
+      <div className="text-[10px] uppercase tracking-widest text-slate-500 mb-1.5">Score Breakdown</div>
+      <div className="grid grid-cols-3 gap-1 text-[10px] font-mono">
+        {items.map(([k, v, mx]) => {
+          const pct = (v / mx) * 100
+          const color = pct >= 75 ? 'text-emerald-400' : pct >= 50 ? 'text-amber-400' : 'text-rose-400'
+          return (
+            <div key={k} className="flex items-center justify-between px-1.5 py-1 bg-slate-950/40 rounded border border-slate-800/50">
+              <span className="text-slate-500">{k}</span>
+              <span className={`font-bold ${color}`}>{v}/{mx}</span>
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+function OpportunityRail({ ranked, activeSymbol, onPick }) {
+  if (!ranked?.length) return null
+  return (
+    <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+      {ranked.map((s) => {
+        const st = priorityStyle(s.priority)
+        const b = s.best
+        const active = s.symbol === activeSymbol
+        return (
+          <button key={s.symbol} onClick={() => onPick(s.symbol)}
+            className={`text-left rounded-md border p-3 transition hover:bg-slate-800/30 ${active ? 'border-emerald-400/60 bg-emerald-500/5' : 'border-slate-800 bg-slate-900/40'}`}
+          >
+            <div className="flex items-center justify-between mb-1">
+              <span className="text-xs font-bold text-slate-200">{s.symbol}</span>
+              <span className={`text-[10px] font-mono ${st.color}`}>{st.label}</span>
+            </div>
+            {b ? (
+              <>
+                <div className="text-sm font-mono font-bold text-slate-100">
+                  {s.action === 'TRADE' ? `BUY ${b.side} ${b.strike}` : `${b.side} ${b.strike}`}
+                </div>
+                <div className="flex items-center justify-between mt-1 text-[10px] font-mono">
+                  <span className="text-slate-500">LTP ₹{fmt(b.ltp)}</span>
+                  <span className={`font-bold ${st.color}`}>{b.score}/100</span>
+                </div>
+              </>
+            ) : <div className="text-xs text-slate-500 font-mono">No candidate</div>}
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
+function SignalHistoryPanel({ rows }) {
+  return (
+    <Card className="bg-slate-900/50 border-slate-800/70 p-3">
+      <div className="flex items-center gap-2 mb-2">
+        <Clock className="w-4 h-4 text-emerald-400" />
+        <span className="text-sm font-bold text-slate-100">Signal History</span>
+        <Badge variant="outline" className="border-slate-700 text-slate-500 text-[9px]">{rows.length} events</Badge>
+      </div>
+      {rows.length === 0 ? (
+        <div className="text-xs text-slate-500 py-4 text-center">No signals recorded yet. Run a scan to populate.</div>
+      ) : (
+        <div className="max-h-64 overflow-y-auto">
+          <table className="w-full text-xs font-mono">
+            <thead className="text-[10px] uppercase text-slate-500">
+              <tr className="border-b border-slate-800">
+                <th className="text-left py-1.5 px-1">Time</th>
+                <th className="text-left px-1">Symbol</th>
+                <th className="text-left px-1">Signal</th>
+                <th className="text-right px-1">Score</th>
+                <th className="text-left px-1">Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r) => {
+                const statusColor = r.status === 'NEW' ? 'text-emerald-400' :
+                  r.status === 'ACTIVE' ? 'text-emerald-300' :
+                  r.status === 'STRENGTHENING' ? 'text-emerald-400' :
+                  r.status === 'WEAKENING' ? 'text-amber-400' :
+                  r.status === 'INVALIDATED' ? 'text-rose-400' : 'text-slate-400'
+                return (
+                  <tr key={r._id} className="border-b border-slate-800/40 hover:bg-slate-800/20">
+                    <td className="py-1.5 px-1 text-slate-500">{timeAgo(r.created_at)}</td>
+                    <td className="px-1 text-slate-300">{r.symbol}</td>
+                    <td className="px-1 text-slate-200">{r.action === 'TRADE' ? `BUY ${r.side} ${r.strike}` : 'NO TRADE'}</td>
+                    <td className={`px-1 text-right font-bold ${r.score >= 80 ? 'text-emerald-400' : r.score >= 75 ? 'text-amber-400' : 'text-slate-500'}`}>{r.score || 0}</td>
+                    <td className={`px-1 ${statusColor}`}>{r.status}</td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </Card>
+  )
+}
+
 function OptionChainTable({ chain }) {
   if (!chain) return null
   const { rows, atm, walls } = chain
   const atmIdx = rows.findIndex(r => r.strikePrice === atm)
-  const visible = rows.slice(Math.max(0, atmIdx - 8), Math.min(rows.length, atmIdx + 9))
+  const visible = rows.slice(Math.max(0, atmIdx - 7), Math.min(rows.length, atmIdx + 8))
   const maxOi = Math.max(1, ...rows.flatMap(r => [(r.CE?.openInterest) || 0, (r.PE?.openInterest) || 0]))
   return (
-    <div className="overflow-auto rounded-md border border-slate-800/60">
+    <div className="overflow-auto rounded-md border border-slate-800/60 max-h-96">
       <table className="w-full text-xs font-mono">
         <thead className="sticky top-0 bg-slate-900/95 backdrop-blur text-[10px] uppercase tracking-wider text-slate-500">
           <tr className="border-b border-slate-800">
             <th className="px-2 py-2 text-right">OI</th>
-            <th className="px-2 py-2 text-right">ChgOI</th>
             <th className="px-2 py-2 text-right">Vol</th>
-            <th className="px-2 py-2 text-right">IV</th>
             <th className="px-2 py-2 text-right text-emerald-400">CE LTP</th>
             <th className="px-3 py-2 text-center text-slate-300">STRIKE</th>
             <th className="px-2 py-2 text-left text-rose-400">PE LTP</th>
-            <th className="px-2 py-2 text-left">IV</th>
             <th className="px-2 py-2 text-left">Vol</th>
-            <th className="px-2 py-2 text-left">ChgOI</th>
             <th className="px-2 py-2 text-left">OI</th>
           </tr>
         </thead>
@@ -209,9 +451,7 @@ function OptionChainTable({ chain }) {
                   <div className="absolute inset-y-0 right-0 bg-amber-500/10" style={{ width: `${ceOiPct}%` }} />
                   <span className="relative">{compact(ce.openInterest)}</span>
                 </td>
-                <td className={`px-2 py-1.5 text-right ${ceItm ? 'bg-slate-800/20' : ''} ${(ce.changeinOpenInterest||0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>{compact(ce.changeinOpenInterest)}</td>
                 <td className={`px-2 py-1.5 text-right ${ceItm ? 'bg-slate-800/20' : ''} text-slate-400`}>{compact(ce.totalTradedVolume)}</td>
-                <td className={`px-2 py-1.5 text-right ${ceItm ? 'bg-slate-800/20' : ''} text-slate-400`}>{ce.impliedVolatility ? fmt(ce.impliedVolatility, 1) : '—'}</td>
                 <td className={`px-2 py-1.5 text-right font-semibold ${ceItm ? 'bg-slate-800/20' : ''} text-emerald-300`}>{ce.lastPrice ? fmt(ce.lastPrice) : '—'}</td>
                 <td className={`px-3 py-1.5 text-center font-bold ${isAtm ? 'text-emerald-400' : 'text-slate-200'}`}>
                   <div className="flex items-center justify-center gap-1">
@@ -221,9 +461,7 @@ function OptionChainTable({ chain }) {
                   </div>
                 </td>
                 <td className={`px-2 py-1.5 text-left font-semibold ${peItm ? 'bg-slate-800/20' : ''} text-rose-300`}>{pe.lastPrice ? fmt(pe.lastPrice) : '—'}</td>
-                <td className={`px-2 py-1.5 text-left ${peItm ? 'bg-slate-800/20' : ''} text-slate-400`}>{pe.impliedVolatility ? fmt(pe.impliedVolatility, 1) : '—'}</td>
                 <td className={`px-2 py-1.5 text-left ${peItm ? 'bg-slate-800/20' : ''} text-slate-400`}>{compact(pe.totalTradedVolume)}</td>
-                <td className={`px-2 py-1.5 text-left ${peItm ? 'bg-slate-800/20' : ''} ${(pe.changeinOpenInterest||0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>{compact(pe.changeinOpenInterest)}</td>
                 <td className={`px-2 py-1.5 text-left relative ${peItm ? 'bg-slate-800/20' : ''}`}>
                   <div className="absolute inset-y-0 left-0 bg-teal-500/10" style={{ width: `${peOiPct}%` }} />
                   <span className="relative">{compact(pe.openInterest)}</span>
@@ -237,149 +475,10 @@ function OptionChainTable({ chain }) {
   )
 }
 
-function ChainSummary({ chain }) {
-  if (!chain) return null
-  const bias = chain.pcr > 1.2 ? 'BULLISH' : chain.pcr < 0.8 ? 'BEARISH' : 'NEUTRAL'
-  const biasColor = bias === 'BULLISH' ? 'text-emerald-400' : bias === 'BEARISH' ? 'text-rose-400' : 'text-slate-300'
-  const items = [
-    { label: 'Spot', val: fmt(chain.spot), sub: chain.symbol },
-    { label: 'ATM', val: chain.atm, sub: chain.expiry },
-    { label: 'PCR', val: chain.pcr ?? '—', sub: bias, subColor: biasColor },
-    { label: 'Max Pain', val: chain.maxPain ?? '—', sub: chain.maxPain && chain.spot ? `${chain.spot > chain.maxPain ? '+' : ''}${fmt(chain.spot - chain.maxPain, 0)}` : '' },
-    { label: 'ATM IV', val: chain.atmIv ? fmt(chain.atmIv, 1) + '%' : '—', sub: 'implied vol' },
-    { label: 'Resistance', val: chain.walls?.resistance?.strike ?? '—', sub: `CE OI ${compact(chain.walls?.resistance?.oi)}`, subColor: 'text-amber-400' },
-    { label: 'Support', val: chain.walls?.support?.strike ?? '—', sub: `PE OI ${compact(chain.walls?.support?.oi)}`, subColor: 'text-rose-400' },
-  ]
-  return (
-    <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-2">
-      {items.map(it => (
-        <div key={it.label} className="border border-slate-800/60 rounded-md px-3 py-2 bg-slate-900/40">
-          <div className="text-[9px] uppercase tracking-widest text-slate-500">{it.label}</div>
-          <div className="text-lg font-mono font-bold text-slate-100">{it.val}</div>
-          <div className={`text-[10px] font-mono ${it.subColor || 'text-slate-500'}`}>{it.sub}</div>
-        </div>
-      ))}
-    </div>
-  )
-}
-
-function TradeCard({ analysis }) {
-  if (!analysis) return null
-  const a = analysis
-  const isTrade = a.action === 'TRADE' && a.trade
-  const biasColor = a.bias?.includes('BULLISH') ? 'text-emerald-400 border-emerald-500/30 bg-emerald-500/5'
-    : a.bias?.includes('BEARISH') ? 'text-rose-400 border-rose-500/30 bg-rose-500/5'
-    : 'text-slate-300 border-slate-700 bg-slate-800/30'
-  const scoreColor = a.score >= 75 ? 'text-emerald-400' : a.score >= 55 ? 'text-amber-400' : 'text-rose-400'
-
-  return (
-    <Card className="bg-slate-900/50 border-slate-800/70 p-4 space-y-3">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <Sparkles className="w-4 h-4 text-emerald-400" />
-          <span className="text-sm font-bold text-slate-100">AI Setup</span>
-          <Badge className={`${biasColor} font-mono border`}>{a.bias?.replace('_', ' ')}</Badge>
-          <Badge variant="outline" className="border-slate-700 text-slate-400 font-mono">VOL: {a.volatility_regime}</Badge>
-        </div>
-        <div className="text-right">
-          <div className="text-[9px] uppercase tracking-widest text-slate-500">AI Score</div>
-          <div className={`text-2xl font-mono font-bold ${scoreColor}`}>{a.score}<span className="text-slate-600 text-sm">/100</span></div>
-        </div>
-      </div>
-
-      {isTrade ? (
-        <>
-          <div className="bg-slate-950/60 border border-emerald-500/20 rounded-md p-3 space-y-2">
-            <div className="flex items-center justify-between">
-              <div>
-                <div className="text-[10px] uppercase tracking-widest text-slate-500">Strategy</div>
-                <div className="text-base font-bold text-emerald-400">{a.trade.strategy}</div>
-              </div>
-              <Badge className="bg-emerald-500 hover:bg-emerald-500 text-slate-950 font-bold text-xs">
-                {a.trade.instrument_label}
-              </Badge>
-            </div>
-            <Separator className="bg-slate-800" />
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 font-mono text-sm">
-              <div><div className="text-[9px] uppercase text-slate-500">Entry</div><div className="text-slate-100 font-semibold">₹{fmt(a.trade.entry)}</div></div>
-              <div><div className="text-[9px] uppercase text-slate-500">Stop</div><div className="text-rose-400 font-semibold">₹{fmt(a.trade.stop)}</div></div>
-              <div><div className="text-[9px] uppercase text-slate-500">Target 1</div><div className="text-emerald-400 font-semibold">₹{fmt(a.trade.target1)}</div></div>
-              <div><div className="text-[9px] uppercase text-slate-500">Target 2</div><div className="text-emerald-400 font-semibold">₹{fmt(a.trade.target2)}</div></div>
-              <div><div className="text-[9px] uppercase text-slate-500">Max Loss / lot</div><div className="text-rose-300">₹{compact(a.trade.max_loss_per_lot)}</div></div>
-              <div><div className="text-[9px] uppercase text-slate-500">Max Profit / lot</div><div className="text-emerald-300">{a.trade.max_profit_per_lot != null ? '₹' + compact(a.trade.max_profit_per_lot) : 'Open'}</div></div>
-              <div><div className="text-[9px] uppercase text-slate-500">R:R</div><div className="text-slate-100">{a.trade.risk_reward}</div></div>
-              <div><div className="text-[9px] uppercase text-slate-500">Size hint</div><div className="text-slate-100">{a.trade.lot_size_hint}</div></div>
-            </div>
-            <Separator className="bg-slate-800" />
-            <div className="space-y-1.5">
-              <div className="text-[9px] uppercase tracking-widest text-slate-500">Legs</div>
-              <div className="flex flex-wrap gap-2">
-                {(a.trade.legs || []).map((l, i) => (
-                  <div key={i} className={`px-2 py-1 rounded text-xs font-mono border ${l.action === 'BUY' ? 'text-emerald-400 border-emerald-500/30 bg-emerald-500/5' : 'text-rose-400 border-rose-500/30 bg-rose-500/5'}`}>
-                    {l.action} {l.strike} {l.type} @ ₹{fmt(l.ltp)}
-                  </div>
-                ))}
-              </div>
-            </div>
-          </div>
-
-          <div className="grid md:grid-cols-2 gap-3">
-            <div>
-              <div className="text-[10px] uppercase tracking-widest text-slate-500 mb-1.5">Why this trade</div>
-              <ul className="space-y-1 text-xs text-slate-300">
-                {(a.reasoning || []).map((r, i) => (
-                  <li key={i} className="flex gap-2"><ChevronRight className="w-3 h-3 mt-0.5 text-emerald-400 shrink-0" />{r}</li>
-                ))}
-              </ul>
-            </div>
-            <div className="space-y-2">
-              <div>
-                <div className="text-[10px] uppercase tracking-widest text-slate-500 mb-1.5">Invalidation</div>
-                <div className="text-xs text-amber-300 bg-amber-500/5 border border-amber-500/20 rounded px-2 py-1.5 font-mono">
-                  {a.trade.invalidation}
-                </div>
-              </div>
-              {a.warnings?.length > 0 && (
-                <div>
-                  <div className="text-[10px] uppercase tracking-widest text-slate-500 mb-1.5">Warnings</div>
-                  <ul className="space-y-1 text-xs text-rose-300">
-                    {a.warnings.map((w, i) => <li key={i} className="flex gap-2"><AlertTriangle className="w-3 h-3 mt-0.5 shrink-0" />{w}</li>)}
-                  </ul>
-                </div>
-              )}
-            </div>
-          </div>
-
-          <div className="flex gap-2 pt-1">
-            <Button className="flex-1 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold" disabled>
-              CONFIRM TRADE <Badge variant="outline" className="ml-2 border-slate-950/40 text-slate-950 text-[9px]">P2 · Broker</Badge>
-            </Button>
-            <Button variant="outline" className="border-slate-700 text-slate-300" onClick={() => navigator.clipboard.writeText(JSON.stringify(a.trade, null, 2))}>
-              Copy JSON
-            </Button>
-          </div>
-        </>
-      ) : (
-        <div className="bg-slate-950/60 border border-amber-500/20 rounded-md p-4 space-y-2">
-          <div className="flex items-center gap-2">
-            <ShieldAlert className="w-4 h-4 text-amber-400" />
-            <div className="text-base font-bold text-amber-400">NO TRADE</div>
-          </div>
-          <ul className="space-y-1 text-xs text-slate-300 pl-1">
-            {(a.reasoning || []).map((r, i) => (
-              <li key={i} className="flex gap-2"><ChevronRight className="w-3 h-3 mt-0.5 text-amber-400 shrink-0" />{r}</li>
-            ))}
-          </ul>
-        </div>
-      )}
-    </Card>
-  )
-}
-
 function Copilot({ context }) {
   const [sessionId] = useState(() => (typeof crypto !== 'undefined' ? crypto.randomUUID() : 'sess-' + Date.now()))
   const [messages, setMessages] = useState([
-    { role: 'assistant', text: 'Hi. I am OptionAI Copilot. Ask me about the live market snapshot on the left — "Why bullish on NIFTY?", "Interpret the PCR", "Explain Max Pain", "Is this setup safe?"' },
+    { role: 'assistant', text: 'Hi. I am OptionAI Copilot. Ask me about the current signal, PCR, Max Pain, or any candidate strike.' },
   ])
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
@@ -389,10 +488,10 @@ function Copilot({ context }) {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })
   }, [messages, busy])
 
-  async function send() {
-    const text = input.trim()
+  async function send(overrideText) {
+    const text = (overrideText ?? input).trim()
     if (!text || busy) return
-    setInput('')
+    if (!overrideText) setInput('')
     setMessages(m => [...m, { role: 'user', text }])
     setBusy(true)
     try {
@@ -408,11 +507,11 @@ function Copilot({ context }) {
   }
 
   return (
-    <Card className="bg-slate-900/50 border-slate-800/70 p-0 flex flex-col h-[560px]">
+    <Card className="bg-slate-900/50 border-slate-800/70 p-0 flex flex-col h-[520px]">
       <div className="px-3 py-2 border-b border-slate-800 flex items-center gap-2">
         <Bot className="w-4 h-4 text-emerald-400" />
         <span className="text-sm font-bold text-slate-100">OptionAI Copilot</span>
-        <Badge variant="outline" className="border-emerald-500/30 text-emerald-400 text-[9px]">Claude Sonnet 4.5</Badge>
+        <Badge variant="outline" className="border-emerald-500/30 text-emerald-400 text-[9px]">Claude 4.5</Badge>
       </div>
       <div ref={scrollRef} className="flex-1 overflow-y-auto p-3 space-y-3">
         {messages.map((m, i) => (
@@ -432,14 +531,13 @@ function Copilot({ context }) {
       </div>
       <div className="p-2 border-t border-slate-800 flex gap-2">
         <Input
-          value={input}
-          onChange={e => setInput(e.target.value)}
+          value={input} onChange={e => setInput(e.target.value)}
           onKeyDown={e => e.key === 'Enter' && send()}
-          placeholder="Ask about the market…"
+          placeholder="Ask about the signal…"
           className="bg-slate-950 border-slate-800 text-slate-100 text-xs h-9"
           disabled={busy}
         />
-        <Button size="sm" onClick={send} disabled={busy || !input.trim()} className="bg-emerald-500 hover:bg-emerald-400 text-slate-950 h-9">
+        <Button size="sm" onClick={() => send()} disabled={busy || !input.trim()} className="bg-emerald-500 hover:bg-emerald-400 text-slate-950 h-9">
           <Send className="w-3.5 h-3.5" />
         </Button>
       </div>
@@ -447,51 +545,117 @@ function Copilot({ context }) {
   )
 }
 
+// ---------- MAIN APP ----------
 const App = () => {
-  const [active, setActive] = useState('dashboard')
-  const [symbol, setSymbol] = useState('NIFTY')
-  const { data: indices, stale } = useIndices()
-  const { chain, loading: chainLoading, err: chainErr, refresh } = useOptionChain(symbol)
-  const [analysis, setAnalysis] = useState(null)
-  const [analyzing, setAnalyzing] = useState(false)
+  const [active, setActive] = useState('signal')
+  const [pickedSymbol, setPickedSymbol] = useState('NIFTY')
+  const [chain, setChain] = useState(null)
+  const [chainLoading, setChainLoading] = useState(true)
+  const [chainErr, setChainErr] = useState(null)
+  const { data: scan, loading: scanning, err: scanErr, lastAt, refresh: refreshScan } = useSignalScan()
 
-  const nifty = indices?.indices?.['NIFTY 50']
-  const bnk = indices?.indices?.['NIFTY BANK']
-  const fin = indices?.indices?.['NIFTY FIN SERVICE']
-  const vix = indices?.indices?.['INDIA VIX']
+  // Auto Trade Watch
+  const [autoWatch, setAutoWatch] = useState(false)
+  const [notifOk, setNotifOk] = useState(false)
+  const lastKeyRef = useRef({})
+  const [historyTick, setHistoryTick] = useState(0)
+  const historyRows = useSignalHistory(historyTick)
 
-  async function runAnalysis() {
-    setAnalyzing(true)
-    setAnalysis(null)
+  useEffect(() => {
+    setHistoryTick(t => t + 1)
+  }, [scan])
+
+  // Ask browser notification permission when Auto Watch turns on
+  useEffect(() => {
+    if (!autoWatch) return
+    if (typeof Notification === 'undefined') return
+    if (Notification.permission === 'granted') { setNotifOk(true); return }
+    if (Notification.permission !== 'denied') {
+      Notification.requestPermission().then(p => setNotifOk(p === 'granted'))
+    }
+  }, [autoWatch])
+
+  // Auto-scan loop
+  useEffect(() => {
+    if (!autoWatch) return
+    const id = setInterval(() => { refreshScan() }, SCAN_INTERVAL_MS)
+    return () => clearInterval(id)
+  }, [autoWatch, refreshScan])
+
+  // Notify on strong new/changed signals
+  useEffect(() => {
+    if (!scan?.perSymbol) return
+    for (const s of scan.perSymbol) {
+      const key = s.best ? `${s.symbol}-${s.best.side}-${s.best.strike}` : `${s.symbol}-NT`
+      const score = s.best?.score || 0
+      const prev = lastKeyRef.current[s.symbol]
+      const material = !prev || prev.key !== key || Math.abs(prev.score - score) >= 5
+      if (material && s.action === 'TRADE' && score >= 75) {
+        const title = `🔥 ${s.priority.replace('_', ' ')} · ${s.symbol}`
+        const body = `BUY ${s.best.side} ${s.best.strike} · Score ${score}/100 · Entry ₹${fmt(s.best.entry.low, 1)}–${fmt(s.best.entry.high, 1)}`
+        toast.success(body, { description: title, duration: 8000 })
+        if (autoWatch && notifOk && typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+          try { new Notification(title, { body, tag: key, requireInteraction: false }) } catch (_) {}
+        }
+      }
+      lastKeyRef.current[s.symbol] = { key, score }
+    }
+  }, [scan, autoWatch, notifOk])
+
+  // Load option chain for the picked symbol
+  useEffect(() => {
+    let alive = true
+    setChainLoading(true)
+    fetch(`/api/market/option-chain?symbol=${pickedSymbol}`, { cache: 'no-store' })
+      .then(r => r.json())
+      .then(j => { if (!alive) return; if (j.ok) { setChain(j.data); setChainErr(null) } else setChainErr(j.error) })
+      .catch(e => { if (alive) setChainErr(e.message) })
+      .finally(() => { if (alive) setChainLoading(false) })
+    return () => { alive = false }
+  }, [pickedSymbol, scan?.timestamp])
+
+  const activeResult = useMemo(() => {
+    return scan?.perSymbol?.find(s => s.symbol === pickedSymbol) || null
+  }, [scan, pickedSymbol])
+  const bestOverall = scan?.bestOverall || null
+
+  const nifty = scan?.indices?.['NIFTY 50']
+  const bnk = scan?.indices?.['NIFTY BANK']
+  const fin = scan?.indices?.['NIFTY FIN SERVICE']
+  const vix = scan?.indices?.['INDIA VIX']
+
+  const copilotContext = useMemo(() => activeResult ? {
+    symbol: activeResult.symbol,
+    signal: activeResult.best ? {
+      side: activeResult.best.side, strike: activeResult.best.strike, expiry: activeResult.best.expiry,
+      ltp: activeResult.best.ltp, entry: activeResult.best.entry, stop: activeResult.best.stop,
+      target1: activeResult.best.target1, target2: activeResult.best.target2,
+      score: activeResult.best.score, breakdown: activeResult.best.breakdown,
+      reasoning: activeResult.best.reasoning, invalidation: activeResult.best.invalidation,
+    } : null,
+    action: activeResult.action, priority: activeResult.priority,
+    chain: activeResult.chainSummary,
+    vix: vix?.last,
+  } : null, [activeResult, vix])
+
+  async function explainWithAI() {
+    if (!activeResult?.best) return
+    toast.info('Sending signal to Claude 4.5 for deeper explanation…')
     try {
-      const r = await fetch('/api/ai/analyze', {
+      const sid = 'explain-' + Date.now()
+      const r = await fetch('/api/ai/chat', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ symbol }),
+        body: JSON.stringify({
+          session_id: sid,
+          message: `Give me a 3-4 sentence deeper interpretation of this signal, focusing on WHAT COULD GO WRONG and WHEN TO EXIT EARLY. Be direct, no fluff.`,
+          context: copilotContext,
+        }),
       })
       const j = await r.json()
-      if (j.ok) {
-        setAnalysis(j.analysis)
-        toast.success(`AI analysis complete · Score ${j.analysis.score}/100`)
-      } else {
-        toast.error('AI analysis failed: ' + (j.error || 'unknown'))
-      }
+      if (j.ok) toast.success(j.reply, { duration: 15000 })
+      else toast.error(j.error || 'AI explain failed')
     } catch (e) { toast.error(e.message) }
-    finally { setAnalyzing(false) }
   }
-
-  const copilotContext = useMemo(() => {
-    if (!chain) return null
-    return {
-      symbol: chain.symbol, spot: chain.spot, expiry: chain.expiry, atm: chain.atm,
-      pcr: chain.pcr, maxPain: chain.maxPain, atmIv: chain.atmIv,
-      walls: chain.walls, totals: chain.totals,
-      indices: {
-        nifty: nifty ? { ltp: nifty.last, chgPct: nifty.percentChange } : null,
-        vix: vix ? { ltp: vix.last, chgPct: vix.percentChange } : null,
-      },
-      latestAnalysis: analysis || null,
-    }
-  }, [chain, nifty, vix, analysis])
 
   return (
     <div className="h-screen flex flex-col bg-slate-950">
@@ -503,7 +667,7 @@ const App = () => {
           <IndexTile label="INDIA VIX" tick={vix} />
         </div>
         <div className="flex items-center gap-2 px-4">
-          <StatusPill label="Data" state={stale ? 'STALE' : nifty ? 'LIVE' : 'INIT'} color={stale ? 'amber' : nifty ? 'green' : 'slate'} />
+          <StatusPill label="Data" state={scanErr ? 'STALE' : nifty ? 'LIVE' : 'INIT'} color={scanErr ? 'amber' : nifty ? 'green' : 'slate'} />
           <StatusPill label="Broker" state="NOT CFG" color="slate" />
           <StatusPill label="Trading" state="ANALYSIS" color="amber" />
           <StatusPill label="AI" state="ONLINE" color="green" />
@@ -514,85 +678,101 @@ const App = () => {
         <Sidebar active={active} onSelect={setActive} />
 
         <main className="flex-1 overflow-y-auto p-4 space-y-4">
-          <div className="flex flex-wrap items-center gap-2">
-            <div className="flex rounded-md border border-slate-800 overflow-hidden">
-              {SYMBOLS.map(s => (
-                <button
-                  key={s}
-                  onClick={() => setSymbol(s)}
-                  className={`px-3 py-1.5 text-xs font-mono font-semibold transition ${
-                    symbol === s ? 'bg-emerald-500 text-slate-950' : 'bg-slate-900 text-slate-400 hover:bg-slate-800'
-                  }`}
-                >{s}</button>
-              ))}
+          {/* Auto Trade Watch Bar */}
+          <Card className="bg-slate-900/50 border-slate-800/70 p-3 flex flex-wrap items-center gap-3">
+            <div className="flex items-center gap-2">
+              {autoWatch ? <BellRing className="w-4 h-4 text-emerald-400 animate-pulse" /> : <Bell className="w-4 h-4 text-slate-500" />}
+              <span className="text-sm font-bold text-slate-100">Auto Trade Watch</span>
+              <span className="text-[10px] font-mono text-slate-500">scans every {SCAN_INTERVAL_MS / 60000}m · alerts on score ≥ 75</span>
             </div>
-            <Button size="sm" variant="outline" className="border-slate-700 text-slate-300 h-8" onClick={refresh}>
-              <Radio className="w-3 h-3 mr-1" /> Refresh Chain
-            </Button>
+            <div className="flex items-center gap-2">
+              <Switch checked={autoWatch} onCheckedChange={setAutoWatch} />
+              <Badge variant="outline" className={`text-[10px] ${autoWatch ? 'border-emerald-500/40 text-emerald-400' : 'border-slate-700 text-slate-500'}`}>
+                {autoWatch ? (notifOk ? 'BROWSER ALERTS ON' : 'IN-APP ONLY') : 'OFF'}
+              </Badge>
+            </div>
             <div className="flex-1" />
-            <Button size="sm" onClick={runAnalysis} disabled={analyzing || !chain} className="bg-emerald-500 hover:bg-emerald-400 text-slate-950 h-8 font-bold">
-              {analyzing ? <><Loader2 className="w-3 h-3 mr-1 animate-spin" /> Analyzing…</> : <><Brain className="w-3 h-3 mr-1" /> Analyze {symbol}</>}
+            <span className="text-[10px] font-mono text-slate-500">
+              {scanning ? 'scanning…' : lastAt ? `last scan ${timeAgo(lastAt)}` : ''}
+            </span>
+            <Button size="sm" variant="outline" className="border-slate-700 text-slate-300 h-8" onClick={refreshScan} disabled={scanning}>
+              {scanning ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
+              <span className="ml-1.5">Rescan Now</span>
             </Button>
-          </div>
+          </Card>
 
-          {chainErr && (
+          {scanErr && (
             <Card className="p-3 bg-rose-500/5 border-rose-500/20 text-rose-300 text-xs flex items-center gap-2">
-              <AlertTriangle className="w-4 h-4" /> Market data error: {chainErr} · NSE may be rate-limiting. Retry in a few seconds.
-              <Button size="sm" variant="outline" className="ml-auto h-7 border-rose-500/30 text-rose-300" onClick={refresh}>Retry</Button>
+              <XCircle className="w-4 h-4" /> Scan error: {scanErr}
             </Card>
           )}
 
-          {chainLoading && !chain && (
-            <div className="flex items-center gap-2 text-slate-500 text-xs"><Loader2 className="w-3.5 h-3.5 animate-spin" /> Loading live option chain from NSE…</div>
-          )}
-
-          {chain && (
+          {scan && (
             <>
-              <ChainSummary chain={chain} />
+              {/* Opportunity Rail */}
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <div className="flex items-center gap-2">
+                    <Sparkles className="w-4 h-4 text-emerald-400" />
+                    <span className="text-sm font-bold text-slate-100">Multi-Market Scan</span>
+                    {bestOverall && (
+                      <Badge className="bg-emerald-400 text-slate-950 font-bold text-[10px]">
+                        BEST: {bestOverall.symbol} · {bestOverall.best?.strikeLabel} · {bestOverall.best?.score}/100
+                      </Badge>
+                    )}
+                  </div>
+                  <span className="text-[10px] font-mono text-slate-500">{scan.timestamp && `snapshot ${timeAgo(scan.timestamp)}`}</span>
+                </div>
+                <OpportunityRail ranked={scan.ranked} activeSymbol={pickedSymbol} onPick={setPickedSymbol} />
+              </div>
+
+              {/* MAIN SIGNAL CARD */}
+              <TradeSignalCard
+                symbolResult={activeResult}
+                isBest={bestOverall?.symbol === pickedSymbol && activeResult?.action === 'TRADE'}
+                onExplain={explainWithAI}
+              />
 
               <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
                 <div className="xl:col-span-2 space-y-4">
-                  <Card className="bg-slate-900/50 border-slate-800/70 p-3">
-                    <div className="flex items-center justify-between mb-2">
-                      <div className="flex items-center gap-2">
-                        <BarChart3 className="w-4 h-4 text-emerald-400" />
-                        <span className="text-sm font-bold text-slate-100">Option Chain · {symbol}</span>
-                        <Badge variant="outline" className="border-slate-700 text-slate-400 text-[9px]">{chain.expiry}</Badge>
+                  {chain && (
+                    <Card className="bg-slate-900/50 border-slate-800/70 p-3">
+                      <div className="flex items-center justify-between mb-2">
+                        <div className="flex items-center gap-2">
+                          <BarChart3 className="w-4 h-4 text-emerald-400" />
+                          <span className="text-sm font-bold text-slate-100">Option Chain · {pickedSymbol}</span>
+                          <Badge variant="outline" className="border-slate-700 text-slate-400 text-[9px]">{chain.expiry}</Badge>
+                          <Badge variant="outline" className="border-slate-700 text-slate-500 text-[9px] font-mono">
+                            PCR {chain.pcr} · MaxPain {chain.maxPain} · ATM {chain.atm}
+                          </Badge>
+                        </div>
+                        <div className="text-[10px] font-mono text-slate-500">Updated {timeAgo(chain.timestamp)}</div>
                       </div>
-                      <div className="text-[10px] font-mono text-slate-500">Updated {new Date(chain.timestamp).toLocaleTimeString('en-IN')}</div>
-                    </div>
-                    <OptionChainTable chain={chain} />
-                  </Card>
-
-                  {analysis && <TradeCard analysis={analysis} />}
-
-                  {!analysis && !analyzing && (
-                    <Card className="bg-slate-900/30 border-dashed border-slate-800 p-6 text-center">
-                      <Brain className="w-8 h-8 mx-auto text-slate-600 mb-2" />
-                      <div className="text-sm text-slate-400">Press <span className="text-emerald-400 font-bold">Analyze {symbol}</span> to let OptionAI scan the live chain, compute the setup, and explain its reasoning.</div>
+                      <OptionChainTable chain={chain} />
+                    </Card>
+                  )}
+                  {chainLoading && !chain && (
+                    <div className="flex items-center gap-2 text-slate-500 text-xs"><Loader2 className="w-3.5 h-3.5 animate-spin" /> Loading option chain…</div>
+                  )}
+                  {chainErr && (
+                    <Card className="p-3 bg-rose-500/5 border-rose-500/20 text-rose-300 text-xs">
+                      Chain error: {chainErr}
                     </Card>
                   )}
                 </div>
 
                 <div className="space-y-4">
-                  <Card className="bg-slate-900/50 border-slate-800/70 p-3 space-y-2">
-                    <div className="flex items-center gap-2">
-                      <Gauge className="w-4 h-4 text-emerald-400" />
-                      <span className="text-sm font-bold text-slate-100">Risk (Config · P2)</span>
-                    </div>
-                    <div className="space-y-1.5 text-xs font-mono">
-                      <div className="flex justify-between text-slate-400"><span>Capital</span><span className="text-slate-200">₹1,00,000</span></div>
-                      <div className="flex justify-between text-slate-400"><span>Risk / trade</span><span className="text-slate-200">1% (₹1,000)</span></div>
-                      <div className="flex justify-between text-slate-400"><span>Daily max loss</span><span className="text-slate-200">₹3,000</span></div>
-                      <div className="flex justify-between text-slate-400"><span>Today&apos;s P&amp;L</span><span className="text-slate-500">— broker not connected</span></div>
-                      <div className="flex justify-between text-slate-400"><span>Daily risk left</span><span className="text-emerald-400">₹3,000</span></div>
-                    </div>
-                  </Card>
-
+                  <SignalHistoryPanel rows={historyRows} />
                   <Copilot context={copilotContext} />
                 </div>
               </div>
             </>
+          )}
+
+          {!scan && !scanErr && (
+            <div className="flex items-center gap-2 text-slate-500 text-xs py-10 justify-center">
+              <Loader2 className="w-4 h-4 animate-spin" /> Scanning NIFTY / BANKNIFTY / FINNIFTY for actionable trades…
+            </div>
           )}
         </main>
       </div>
@@ -600,14 +780,12 @@ const App = () => {
       <footer className="h-8 border-t border-slate-800/60 bg-slate-950 flex items-center px-4 text-[10px] font-mono text-slate-500 justify-between">
         <div className="flex items-center gap-3">
           <Activity className="w-3 h-3" />
-          <span>Personal Terminal · Analysis Mode · No orders will be placed</span>
+          <span>Personal Terminal · Analysis Mode · No orders will be placed · Signal Score is NOT a probability of profit</span>
         </div>
         <div className="flex items-center gap-4">
           <span>Data: NSE India (public)</span>
           <span>·</span>
-          <span>AI: Claude Sonnet 4.5 via Emergent</span>
-          <span>·</span>
-          <span className="text-slate-600">Phase 1 · Broker + OMS in Phase 2</span>
+          <span>Engine: Deterministic Quant + Claude 4.5</span>
         </div>
       </footer>
     </div>
