@@ -1,8 +1,23 @@
 import { NextResponse } from 'next/server';
 import { LlmChat, UserMessage } from 'emergentintegrations';
+import { MongoClient } from 'mongodb';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
+
+// ------------- MONGO -------------
+let mongoPromise = null;
+function getMongo() {
+  if (!mongoPromise) {
+    const uri = process.env.MONGO_URL || 'mongodb://localhost:27017';
+    mongoPromise = new MongoClient(uri).connect();
+  }
+  return mongoPromise;
+}
+async function getDb() {
+  const client = await getMongo();
+  return client.db(process.env.DB_NAME && process.env.DB_NAME !== 'your_database_name' ? process.env.DB_NAME : 'optionai');
+}
 
 // ------------- NSE HELPERS -------------
 let nseCookieCache = { cookie: null, ts: 0 };
@@ -363,12 +378,38 @@ async function routePost(request, path) {
     if (!message) return json({ error: 'message required' }, 400);
     if (!sessionId) return json({ error: 'session_id required' }, 400);
     try {
-      const chat = getChat(sessionId, COPILOT_SYSTEM);
+      const db = await getDb();
+      const col = db.collection('chat_sessions');
+      const doc = await col.findOne({ session_id: sessionId });
+      const history = Array.isArray(doc?.messages) ? doc.messages : [];
+      const initialMessages = [{ role: 'system', content: COPILOT_SYSTEM }, ...history];
+
+      const chat = new LlmChat(process.env.EMERGENT_LLM_KEY, sessionId, COPILOT_SYSTEM, initialMessages)
+        .withModel('anthropic', 'claude-sonnet-4-5-20250929')
+        .withParams({ temperature: 0.2, max_tokens: 1500 });
+
       const composed = context
-        ? `Current market snapshot (JSON):\n${JSON.stringify(context).slice(0, 8000)}\n\nUser: ${message}`
+        ? `[Live market snapshot JSON: ${JSON.stringify(context).slice(0, 6000)}]\n\n${message}`
         : message;
-      const reply = await chat.sendMessage(new UserMessage({ text: composed }));
-      return json({ ok: true, reply: String(reply), session_id: sessionId });
+
+      const reply = String(await chat.sendMessage(new UserMessage({ text: composed })));
+
+      // Persist ONLY the raw user question + assistant reply so future turns are not
+      // polluted by stale snapshot JSON.
+      await col.updateOne(
+        { session_id: sessionId },
+        {
+          $set: { session_id: sessionId, updated_at: new Date() },
+          $setOnInsert: { created_at: new Date() },
+          $push: { messages: { $each: [
+            { role: 'user', content: message },
+            { role: 'assistant', content: reply },
+          ] } },
+        },
+        { upsert: true }
+      );
+
+      return json({ ok: true, reply, session_id: sessionId });
     } catch (e) {
       return json({ ok: false, error: e.message }, 500);
     }
