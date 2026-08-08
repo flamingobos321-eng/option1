@@ -88,6 +88,144 @@ function useBrokerStatus() {
   return { status, refresh: load }
 }
 
+function usePositionsAndFunds(connected) {
+  const [positions, setPositions] = useState(null)
+  const [funds, setFunds] = useState(null)
+  const [loading, setLoading] = useState(false)
+  const [err, setErr] = useState(null)
+  const [lastAt, setLastAt] = useState(null)
+
+  const load = useCallback(async () => {
+    if (!connected) return
+    setLoading(true)
+    try {
+      const [pr, fr] = await Promise.all([
+        fetch('/api/broker/kite/positions', { cache: 'no-store' }).then(r => r.json()),
+        fetch('/api/broker/kite/funds', { cache: 'no-store' }).then(r => r.json()),
+      ])
+      if (pr.ok) setPositions(pr.positions); else setErr(pr.error)
+      if (fr.ok) setFunds(fr.margins); else setErr(fr.error)
+      setLastAt(new Date().toISOString())
+    } catch (e) { setErr(e.message) } finally { setLoading(false) }
+  }, [connected])
+
+  useEffect(() => {
+    if (!connected) { setPositions(null); setFunds(null); return }
+    load()
+    const id = setInterval(load, 12000)
+    return () => clearInterval(id)
+  }, [connected, load])
+
+  return { positions, funds, loading, err, lastAt, refresh: load }
+}
+
+function PositionsPanel({ positions, funds, loading, err, lastAt, onRefresh }) {
+  const day = positions?.day || []
+  const openPositions = day.filter(p => p.quantity !== 0)
+  const totalPnl = day.reduce((sum, p) => sum + (Number(p.pnl) || 0), 0)
+  const unrealised = day.reduce((sum, p) => sum + (Number(p.unrealised) || 0), 0)
+  const realised = day.reduce((sum, p) => sum + (Number(p.realised) || 0), 0)
+
+  const equity = funds?.equity || {}
+  const available = equity?.available?.live_balance ?? equity?.available?.cash ?? null
+  const utilised = equity?.utilised?.debits ?? equity?.utilised?.m2m_unrealised ?? null
+
+  return (
+    <Card className="bg-slate-900/50 border-slate-800/70 p-3">
+      <div className="flex items-center gap-2 mb-2">
+        <Wallet className="w-4 h-4 text-emerald-400" />
+        <span className="text-sm font-bold text-slate-100">Live Positions & P&amp;L</span>
+        <Badge variant="outline" className="border-emerald-500/30 text-emerald-400 text-[9px]">KITE</Badge>
+        <div className="flex-1" />
+        <span className="text-[9px] font-mono text-slate-500">{lastAt ? timeAgo(lastAt) : '—'}</span>
+        <button onClick={onRefresh} className="text-slate-500 hover:text-slate-300 p-1">
+          {loading ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
+        </button>
+      </div>
+
+      {/* Aggregate P&L strip */}
+      <div className="grid grid-cols-3 gap-1.5 mb-2">
+        <div className={`border rounded px-2 py-1.5 ${totalPnl >= 0 ? 'border-emerald-500/30 bg-emerald-500/5' : 'border-rose-500/30 bg-rose-500/5'}`}>
+          <div className="text-[9px] uppercase tracking-wider text-slate-500">Today P&amp;L</div>
+          <div className={`text-lg font-mono font-bold ${totalPnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+            {totalPnl >= 0 ? '+' : ''}₹{compact(Math.abs(Math.round(totalPnl)))}
+          </div>
+        </div>
+        <div className="border border-slate-800 rounded px-2 py-1.5 bg-slate-950/40">
+          <div className="text-[9px] uppercase tracking-wider text-slate-500">Available</div>
+          <div className="text-sm font-mono font-bold text-slate-100">
+            {available != null ? '₹' + compact(Math.round(available)) : '—'}
+          </div>
+        </div>
+        <div className="border border-slate-800 rounded px-2 py-1.5 bg-slate-950/40">
+          <div className="text-[9px] uppercase tracking-wider text-slate-500">Used Margin</div>
+          <div className="text-sm font-mono font-bold text-slate-300">
+            {utilised != null ? '₹' + compact(Math.round(utilised)) : '—'}
+          </div>
+        </div>
+      </div>
+
+      {/* Realized / Unrealized split */}
+      <div className="flex items-center gap-2 mb-2 text-[10px] font-mono">
+        <span className="text-slate-500">Unrealised:</span>
+        <span className={unrealised >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
+          {unrealised >= 0 ? '+' : ''}₹{fmt(unrealised, 0)}
+        </span>
+        <span className="text-slate-600">·</span>
+        <span className="text-slate-500">Realised:</span>
+        <span className={realised >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
+          {realised >= 0 ? '+' : ''}₹{fmt(realised, 0)}
+        </span>
+      </div>
+
+      {err && <div className="text-xs text-rose-400 bg-rose-500/5 border border-rose-500/20 rounded px-2 py-1.5 mb-2 font-mono">{err}</div>}
+
+      {/* Positions Table */}
+      {openPositions.length === 0 ? (
+        <div className="text-xs text-slate-500 py-4 text-center border border-dashed border-slate-800 rounded">
+          No open positions. When you place a trade it will appear here in ~10s.
+        </div>
+      ) : (
+        <div className="max-h-64 overflow-y-auto">
+          <table className="w-full text-xs font-mono">
+            <thead className="text-[9px] uppercase text-slate-500 sticky top-0 bg-slate-900/95">
+              <tr className="border-b border-slate-800">
+                <th className="text-left py-1.5 px-1">Contract</th>
+                <th className="text-right px-1">Qty</th>
+                <th className="text-right px-1">Avg</th>
+                <th className="text-right px-1">LTP</th>
+                <th className="text-right px-1">P&amp;L</th>
+              </tr>
+            </thead>
+            <tbody>
+              {openPositions.map((p, i) => {
+                const pnl = Number(p.pnl) || 0
+                const pnlPct = p.average_price ? (pnl / (p.average_price * Math.abs(p.quantity))) * 100 : 0
+                const isBuy = p.quantity > 0
+                return (
+                  <tr key={i} className="border-b border-slate-800/40 hover:bg-slate-800/20">
+                    <td className="py-1.5 px-1">
+                      <div className="text-slate-200 truncate max-w-[140px]" title={p.tradingsymbol}>{p.tradingsymbol}</div>
+                      <div className="text-[9px] text-slate-500">{p.product} · {isBuy ? 'LONG' : 'SHORT'}</div>
+                    </td>
+                    <td className={`px-1 text-right ${isBuy ? 'text-emerald-300' : 'text-rose-300'}`}>{p.quantity}</td>
+                    <td className="px-1 text-right text-slate-400">{fmt(p.average_price, 1)}</td>
+                    <td className="px-1 text-right text-slate-200 font-semibold">{fmt(p.last_price, 1)}</td>
+                    <td className={`px-1 text-right font-bold ${pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                      {pnl >= 0 ? '+' : ''}{fmt(pnl, 0)}
+                      <div className="text-[9px] text-slate-500">{pnl >= 0 ? '+' : ''}{fmt(pnlPct, 1)}%</div>
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </Card>
+  )
+}
+
 async function connectKite() {
   try {
     const r = await fetch('/api/broker/kite/login-url')
@@ -291,13 +429,13 @@ function StatusPill({ label, state, color }) {
   )
 }
 
-function Sidebar({ active, onSelect }) {
+function Sidebar({ active, onSelect, brokerConnected }) {
   const items = [
     { id: 'signal', label: 'Trade Signal', icon: Flame },
     { id: 'chain', label: 'Option Chain', icon: BarChart3 },
     { id: 'copilot', label: 'Copilot', icon: Bot },
     { id: 'history', label: 'Signal Log', icon: Clock },
-    { id: 'positions', label: 'Positions', icon: Wallet, locked: true },
+    { id: 'positions', label: 'Positions', icon: Wallet, locked: !brokerConnected, hint: brokerConnected ? 'RAIL' : 'P2' },
     { id: 'orders', label: 'Orders', icon: ListOrdered, locked: true },
     { id: 'journal', label: 'Journal', icon: LineChart, locked: true },
     { id: 'strategies', label: 'Strategies', icon: Sparkles, locked: true },
@@ -311,7 +449,7 @@ function Sidebar({ active, onSelect }) {
         </div>
         <div>
           <div className="text-sm font-bold text-slate-100">OptionAI</div>
-          <div className="text-[9px] uppercase tracking-widest text-slate-500">Terminal · v0.2</div>
+          <div className="text-[9px] uppercase tracking-widest text-slate-500">Terminal · v0.3</div>
         </div>
       </div>
       <nav className="flex-1 px-2 py-3 space-y-1">
@@ -331,16 +469,16 @@ function Sidebar({ active, onSelect }) {
             >
               <Icon className="w-3.5 h-3.5" />
               <span className="flex-1 text-left">{it.label}</span>
-              {it.locked && <Badge variant="outline" className="text-[8px] px-1 py-0 h-4 border-slate-700 text-slate-500">P2</Badge>}
+              {(it.locked || it.hint) && <Badge variant="outline" className={`text-[8px] px-1 py-0 h-4 ${it.hint === 'RAIL' ? 'border-emerald-500/30 text-emerald-400' : 'border-slate-700 text-slate-500'}`}>{it.hint || 'P2'}</Badge>}
             </button>
           )
         })}
       </nav>
       <div className="p-3 border-t border-slate-800/60 space-y-2">
         <div className="text-[9px] uppercase tracking-widest text-slate-500 px-1">Trading Mode</div>
-        <div className="flex items-center justify-between px-2 py-1.5 bg-amber-500/5 border border-amber-500/20 rounded text-xs">
-          <span className="text-amber-400">ANALYSIS</span>
-          <ShieldAlert className="w-3 h-3 text-amber-400" />
+        <div className={`flex items-center justify-between px-2 py-1.5 rounded text-xs ${brokerConnected ? 'bg-emerald-500/10 border border-emerald-500/30' : 'bg-amber-500/5 border border-amber-500/20'}`}>
+          <span className={brokerConnected ? 'text-emerald-400 font-bold' : 'text-amber-400'}>{brokerConnected ? 'ASSISTED LIVE' : 'ANALYSIS'}</span>
+          {brokerConnected ? <CheckCircle2 className="w-3 h-3 text-emerald-400" /> : <ShieldAlert className="w-3 h-3 text-amber-400" />}
         </div>
         <Button size="sm" variant="destructive" className="w-full h-8 text-xs font-bold" disabled>
           <AlertTriangle className="w-3 h-3 mr-1" /> KILL SWITCH
@@ -756,6 +894,7 @@ const App = () => {
 
   // Broker state
   const { status: broker, refresh: refreshBroker } = useBrokerStatus()
+  const { positions, funds, loading: posLoading, err: posErr, lastAt: posLastAt, refresh: refreshPositions } = usePositionsAndFunds(broker.connected)
   const [tradeModalOpen, setTradeModalOpen] = useState(false)
 
   // Handle ?broker=connected|failed on return from Kite OAuth
@@ -895,7 +1034,7 @@ const App = () => {
       </header>
 
       <div className="flex-1 flex overflow-hidden">
-        <Sidebar active={active} onSelect={setActive} />
+        <Sidebar active={active} onSelect={setActive} brokerConnected={broker.connected} />
 
         <main className="flex-1 overflow-y-auto p-4 space-y-4">
           {/* Auto Trade Watch Bar */}
@@ -984,6 +1123,13 @@ const App = () => {
                 </div>
 
                 <div className="space-y-4">
+                  {broker.connected && (
+                    <PositionsPanel
+                      positions={positions} funds={funds}
+                      loading={posLoading} err={posErr} lastAt={posLastAt}
+                      onRefresh={refreshPositions}
+                    />
+                  )}
                   <SignalHistoryPanel rows={historyRows} />
                   <Copilot context={copilotContext} />
                 </div>
@@ -1018,6 +1164,7 @@ const App = () => {
         onOpenChange={setTradeModalOpen}
         signal={activeResult?.best || null}
         brokerConnected={broker.connected}
+        onOrderPlaced={() => { setTimeout(refreshPositions, 3000) }}
       />
     </div>
   )
