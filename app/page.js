@@ -7,12 +7,13 @@ import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import { Separator } from '@/components/ui/separator'
 import { Switch } from '@/components/ui/switch'
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '@/components/ui/dialog'
 import { toast } from 'sonner'
 import {
   Activity, AlertTriangle, BarChart3, Bell, BellRing, Bot, Brain, ChevronRight,
-  CircleDot, Clock, Flame, Gauge, LayoutDashboard, LineChart, ListOrdered, Loader2,
-  Radio, Send, Settings, ShieldAlert, Sparkles, TrendingDown, TrendingUp,
-  Wallet, Zap, RefreshCw, XCircle
+  CircleDot, Clock, Flame, Gauge, LayoutDashboard, LineChart, Link2, ListOrdered, Loader2,
+  Radio, Send, Settings, ShieldAlert, Sparkles, TrendingDown, TrendingUp, Unlink,
+  Wallet, Zap, RefreshCw, XCircle, CheckCircle2, ShieldCheck
 } from 'lucide-react'
 
 const SYMBOLS = ['NIFTY', 'BANKNIFTY', 'FINNIFTY']
@@ -68,6 +69,191 @@ function useSignalHistory(tick) {
     return () => { alive = false }
   }, [tick])
   return rows
+}
+
+function useBrokerStatus() {
+  const [status, setStatus] = useState({ connected: false, loading: true })
+  const load = useCallback(async () => {
+    try {
+      const r = await fetch('/api/broker/kite/status', { cache: 'no-store' })
+      const j = await r.json()
+      setStatus({ ...j, loading: false })
+    } catch (e) { setStatus({ connected: false, loading: false, error: e.message }) }
+  }, [])
+  useEffect(() => { load() }, [load])
+  useEffect(() => {
+    const id = setInterval(load, 60000)
+    return () => clearInterval(id)
+  }, [load])
+  return { status, refresh: load }
+}
+
+async function connectKite() {
+  try {
+    const r = await fetch('/api/broker/kite/login-url')
+    const j = await r.json()
+    if (j.ok && j.url) window.location.href = j.url
+    else toast.error('Kite login URL error: ' + (j.error || 'unknown'))
+  } catch (e) { toast.error(e.message) }
+}
+
+async function disconnectKite(onDone) {
+  try {
+    await fetch('/api/broker/kite/disconnect', { method: 'POST' })
+    toast.success('Disconnected from Kite')
+    onDone?.()
+  } catch (e) { toast.error(e.message) }
+}
+
+function PlaceTradeModal({ open, onOpenChange, signal, brokerConnected, onOrderPlaced }) {
+  const [lots, setLots] = useState(1)
+  const [orderType, setOrderType] = useState('MARKET')
+  const [product, setProduct] = useState('MIS')
+  const [limitPrice, setLimitPrice] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [result, setResult] = useState(null)
+
+  useEffect(() => {
+    if (open) {
+      setLots(1); setOrderType('MARKET'); setProduct('MIS');
+      setLimitPrice(signal?.ltp ? String(signal.ltp) : ''); setResult(null)
+    }
+  }, [open, signal])
+
+  if (!signal) return null
+  const qty = lots * (signal.lotSize || 1)
+  const estCost = orderType === 'MARKET' ? Math.round(signal.ltp * qty) : Math.round(Number(limitPrice || 0) * qty)
+  const estMaxLoss = Math.round((signal.ltp - signal.stop) * qty)
+
+  async function submit() {
+    setBusy(true)
+    setResult(null)
+    try {
+      const r = await fetch('/api/broker/kite/place-order', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          symbol: signal.symbol,
+          side: 'BUY',
+          strike: signal.strike,
+          type: signal.side,
+          expiry: signal.expiry,
+          quantity: qty,
+          orderType, product,
+          price: orderType === 'LIMIT' ? Number(limitPrice) : undefined,
+          signal_ref: `${signal.symbol}-${signal.side}-${signal.strike}-${signal.expiry}`,
+        }),
+      })
+      const j = await r.json()
+      if (j.ok) {
+        setResult({ ok: true, ...j })
+        toast.success(`Order placed · ID ${j.order_id}${j.duplicate ? ' (duplicate ignored)' : ''}`, { duration: 8000 })
+        onOrderPlaced?.(j)
+      } else {
+        setResult({ ok: false, error: j.error })
+        toast.error('Order failed: ' + j.error)
+      }
+    } catch (e) { setResult({ ok: false, error: e.message }); toast.error(e.message) }
+    finally { setBusy(false) }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="bg-slate-950 border-slate-800 text-slate-100 max-w-lg">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2 text-xl">
+            <ShieldCheck className="w-5 h-5 text-emerald-400" />
+            Confirm Order
+          </DialogTitle>
+          <DialogDescription className="text-slate-400 text-xs">
+            Review carefully. This will place a <span className="text-rose-300 font-semibold">REAL order</span> on Zerodha Kite using your live account.
+          </DialogDescription>
+        </DialogHeader>
+
+        {!brokerConnected ? (
+          <div className="p-4 border border-amber-500/30 bg-amber-500/5 rounded text-xs text-amber-300">
+            Kite is not connected. Click <span className="font-bold">Connect Kite</span> in the header first.
+          </div>
+        ) : (
+          <>
+            <div className="bg-slate-900 border border-slate-800 rounded p-3 space-y-2">
+              <div className="flex items-center gap-2">
+                <Badge className={`text-base font-bold px-3 py-1.5 ${signal.side === 'CE' ? 'bg-emerald-500 text-slate-950' : 'bg-rose-500 text-slate-950'}`}>
+                  BUY {signal.side}
+                </Badge>
+                <span className="text-lg font-mono font-bold">{signal.strikeLabel}</span>
+              </div>
+              <div className="text-[10px] font-mono text-slate-500">Expiry {signal.expiry} · Signal score {signal.score}/100 · LTP ₹{fmt(signal.ltp)}</div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="text-[10px] uppercase tracking-widest text-slate-500">Lots</label>
+                <Input type="number" min={1} max={20} value={lots} onChange={e => setLots(Math.max(1, +e.target.value || 1))} className="bg-slate-900 border-slate-800 text-slate-100 h-9 font-mono" />
+                <div className="text-[10px] font-mono text-slate-500 mt-1">= {qty} qty (lot size {signal.lotSize})</div>
+              </div>
+              <div>
+                <label className="text-[10px] uppercase tracking-widest text-slate-500">Order Type</label>
+                <div className="flex gap-1 mt-1">
+                  {['MARKET', 'LIMIT'].map(t => (
+                    <button key={t} onClick={() => setOrderType(t)}
+                      className={`flex-1 h-9 rounded text-xs font-mono font-semibold border ${orderType === t ? 'bg-emerald-500 text-slate-950 border-emerald-500' : 'bg-slate-900 border-slate-800 text-slate-400'}`}
+                    >{t}</button>
+                  ))}
+                </div>
+              </div>
+              {orderType === 'LIMIT' && (
+                <div>
+                  <label className="text-[10px] uppercase tracking-widest text-slate-500">Limit Price ₹</label>
+                  <Input type="number" step="0.05" value={limitPrice} onChange={e => setLimitPrice(e.target.value)} className="bg-slate-900 border-slate-800 text-slate-100 h-9 font-mono" />
+                  <div className="text-[10px] font-mono text-slate-500 mt-1">signal entry zone ₹{fmt(signal.entry.low, 1)}–{fmt(signal.entry.high, 1)}</div>
+                </div>
+              )}
+              <div>
+                <label className="text-[10px] uppercase tracking-widest text-slate-500">Product</label>
+                <div className="flex gap-1 mt-1">
+                  {['MIS', 'NRML'].map(p => (
+                    <button key={p} onClick={() => setProduct(p)}
+                      className={`flex-1 h-9 rounded text-xs font-mono font-semibold border ${product === p ? 'bg-emerald-500 text-slate-950 border-emerald-500' : 'bg-slate-900 border-slate-800 text-slate-400'}`}
+                    >{p}</button>
+                  ))}
+                </div>
+                <div className="text-[10px] font-mono text-slate-500 mt-1">{product === 'MIS' ? 'Intraday' : 'Carry-forward'}</div>
+              </div>
+            </div>
+
+            <div className="border border-rose-500/20 bg-rose-500/5 rounded p-3 space-y-1.5 font-mono text-xs">
+              <div className="flex justify-between"><span className="text-slate-500">Estimated cost</span><span className="text-slate-200">≈ ₹{compact(estCost)}</span></div>
+              <div className="flex justify-between"><span className="text-slate-500">Max loss if stopped out</span><span className="text-rose-300">≈ ₹{compact(estMaxLoss)}</span></div>
+              <div className="flex justify-between"><span className="text-slate-500">Target 1 (potential gain)</span><span className="text-emerald-300">≈ ₹{compact((signal.target1 - signal.ltp) * qty)}</span></div>
+              <div className="flex justify-between"><span className="text-slate-500">Invalidation</span><span className="text-amber-300 text-right">{signal.invalidation}</span></div>
+            </div>
+
+            <div className="text-[10px] text-slate-500 border-l-2 border-slate-700 pl-2">
+              ⓘ This app has NO daily-loss enforcement yet (Phase 2). You are personally responsible for position sizing and risk.
+              You can cancel/modify this order from Kite Web or here after submission.
+            </div>
+
+            {result && (
+              <div className={`p-2 rounded text-xs font-mono ${result.ok ? 'bg-emerald-500/10 border border-emerald-500/30 text-emerald-200' : 'bg-rose-500/10 border border-rose-500/30 text-rose-200'}`}>
+                {result.ok ? `✓ Order ID: ${result.order_id}${result.duplicate ? ' (already existed)' : ''}` : `✗ ${result.error}`}
+              </div>
+            )}
+          </>
+        )}
+
+        <DialogFooter className="gap-2">
+          <Button variant="outline" className="border-slate-700 text-slate-300" onClick={() => onOpenChange(false)} disabled={busy}>
+            {result?.ok ? 'Close' : 'Cancel'}
+          </Button>
+          {brokerConnected && !result?.ok && (
+            <Button onClick={submit} disabled={busy} className="bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold">
+              {busy ? <><Loader2 className="w-3.5 h-3.5 animate-spin mr-1.5" /> Placing…</> : <>CONFIRM ORDER · {lots} lot{lots > 1 ? 's' : ''}</>}
+            </Button>
+          )}
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
 }
 
 // ---------- COMPONENTS ----------
@@ -185,7 +371,7 @@ function priorityStyle(priority) {
   }
 }
 
-function TradeSignalCard({ symbolResult, isBest, onExplain }) {
+function TradeSignalCard({ symbolResult, isBest, onExplain, brokerConnected, onPlaceTrade }) {
   if (!symbolResult) return null
   const { symbol, action, priority, best, noTradeReasons, chainSummary, indexTick } = symbolResult
   const st = priorityStyle(priority)
@@ -267,9 +453,16 @@ function TradeSignalCard({ symbolResult, isBest, onExplain }) {
           <Separator className="bg-slate-800 my-3" />
 
           <div className="flex flex-wrap items-center gap-2">
-            <Button className={`flex-1 min-w-[200px] text-slate-950 font-bold ${best.side === 'CE' ? 'bg-emerald-500 hover:bg-emerald-400' : 'bg-rose-500 hover:bg-rose-400'}`} disabled>
-              PLACE TRADE
-              <Badge variant="outline" className="ml-2 border-slate-950/40 text-slate-950 text-[9px]">P2 · Broker</Badge>
+            <Button
+              className={`flex-1 min-w-[200px] text-slate-950 font-bold ${best.side === 'CE' ? 'bg-emerald-500 hover:bg-emerald-400' : 'bg-rose-500 hover:bg-rose-400'} disabled:opacity-50`}
+              disabled={!brokerConnected}
+              onClick={() => onPlaceTrade?.(best)}
+            >
+              {brokerConnected ? (
+                <>PLACE TRADE · BUY {best.side} {best.strike}</>
+              ) : (
+                <>Connect Kite to Place <Badge variant="outline" className="ml-2 border-slate-950/40 text-slate-950 text-[9px]">Header ↑</Badge></>
+              )}
             </Button>
             <Button variant="outline" className="border-slate-700 text-slate-300" onClick={onExplain}>
               <Brain className="w-3.5 h-3.5 mr-1.5" /> Explain via AI
@@ -561,6 +754,24 @@ const App = () => {
   const [historyTick, setHistoryTick] = useState(0)
   const historyRows = useSignalHistory(historyTick)
 
+  // Broker state
+  const { status: broker, refresh: refreshBroker } = useBrokerStatus()
+  const [tradeModalOpen, setTradeModalOpen] = useState(false)
+
+  // Handle ?broker=connected|failed on return from Kite OAuth
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const sp = new URLSearchParams(window.location.search)
+    if (sp.get('broker') === 'connected') {
+      toast.success('Kite connected ✓')
+      refreshBroker()
+      window.history.replaceState({}, '', window.location.pathname)
+    } else if (sp.get('broker') === 'failed') {
+      toast.error('Kite connect failed: ' + (sp.get('reason') || 'unknown'))
+      window.history.replaceState({}, '', window.location.pathname)
+    }
+  }, [refreshBroker])
+
   useEffect(() => {
     setHistoryTick(t => t + 1)
   }, [scan])
@@ -668,8 +879,17 @@ const App = () => {
         </div>
         <div className="flex items-center gap-2 px-4">
           <StatusPill label="Data" state={scanErr ? 'STALE' : nifty ? 'LIVE' : 'INIT'} color={scanErr ? 'amber' : nifty ? 'green' : 'slate'} />
-          <StatusPill label="Broker" state="NOT CFG" color="slate" />
-          <StatusPill label="Trading" state="ANALYSIS" color="amber" />
+          <StatusPill label="Broker" state={broker.connected ? `KITE·${broker.user?.user_id || 'OK'}` : 'NOT CFG'} color={broker.connected ? 'green' : 'slate'} />
+          {broker.connected ? (
+            <Button size="sm" variant="outline" className="border-slate-700 text-slate-300 h-7 text-[10px]" onClick={() => disconnectKite(refreshBroker)}>
+              <Unlink className="w-3 h-3 mr-1" /> Disconnect
+            </Button>
+          ) : (
+            <Button size="sm" className="bg-emerald-500 hover:bg-emerald-400 text-slate-950 h-7 text-[10px] font-bold" onClick={connectKite}>
+              <Link2 className="w-3 h-3 mr-1" /> Connect Kite
+            </Button>
+          )}
+          <StatusPill label="Trading" state={broker.connected ? 'ASSISTED' : 'ANALYSIS'} color={broker.connected ? 'green' : 'amber'} />
           <StatusPill label="AI" state="ONLINE" color="green" />
         </div>
       </header>
@@ -731,6 +951,8 @@ const App = () => {
                 symbolResult={activeResult}
                 isBest={bestOverall?.symbol === pickedSymbol && activeResult?.action === 'TRADE'}
                 onExplain={explainWithAI}
+                brokerConnected={broker.connected}
+                onPlaceTrade={(signal) => setTradeModalOpen(true)}
               />
 
               <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
@@ -780,14 +1002,23 @@ const App = () => {
       <footer className="h-8 border-t border-slate-800/60 bg-slate-950 flex items-center px-4 text-[10px] font-mono text-slate-500 justify-between">
         <div className="flex items-center gap-3">
           <Activity className="w-3 h-3" />
-          <span>Personal Terminal · Analysis Mode · No orders will be placed · Signal Score is NOT a probability of profit</span>
+          <span>Personal Terminal · {broker.connected ? 'Assisted Live Trading' : 'Analysis Mode'} · Signal Score is NOT a probability of profit</span>
         </div>
         <div className="flex items-center gap-4">
           <span>Data: NSE India (public)</span>
           <span>·</span>
+          <span>Broker: {broker.connected ? `Zerodha Kite (${broker.user?.user_id})` : 'Not connected'}</span>
+          <span>·</span>
           <span>Engine: Deterministic Quant + Claude 4.5</span>
         </div>
       </footer>
+
+      <PlaceTradeModal
+        open={tradeModalOpen}
+        onOpenChange={setTradeModalOpen}
+        signal={activeResult?.best || null}
+        brokerConnected={broker.connected}
+      />
     </div>
   )
 }

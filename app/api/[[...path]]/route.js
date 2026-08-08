@@ -1,6 +1,8 @@
 import { NextResponse } from 'next/server';
 import { LlmChat, UserMessage } from 'emergentintegrations';
 import { MongoClient } from 'mongodb';
+import { KiteConnect } from 'kiteconnect';
+import crypto from 'crypto';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -512,6 +514,138 @@ async function getSignalHistory(limit = 20) {
   return rows.map((r) => ({ ...r, _id: String(r._id) }));
 }
 
+// ------------- BROKER: ZERODHA KITE -------------
+const KITE = {
+  API_KEY: process.env.KITE_API_KEY,
+  API_SECRET: process.env.KITE_API_SECRET,
+  REDIRECT: process.env.KITE_REDIRECT_URL,
+};
+
+function newKiteClient(withToken = null) {
+  const k = new KiteConnect({ api_key: KITE.API_KEY });
+  if (withToken) k.setAccessToken(withToken);
+  return k;
+}
+
+async function getBrokerToken(broker = 'kite') {
+  const db = await getDb();
+  return db.collection('broker_tokens').findOne({ broker });
+}
+async function saveBrokerToken(broker, data) {
+  const db = await getDb();
+  await db.collection('broker_tokens').updateOne(
+    { broker },
+    { $set: { broker, ...data, updated_at: new Date() } },
+    { upsert: true }
+  );
+}
+async function clearBrokerToken(broker) {
+  const db = await getDb();
+  await db.collection('broker_tokens').deleteOne({ broker });
+}
+
+async function requireKite() {
+  const doc = await getBrokerToken('kite');
+  if (!doc?.access_token) throw new Error('Kite not connected');
+  return { kite: newKiteClient(doc.access_token), token: doc };
+}
+
+// Instrument cache (NFO options universe)
+let instrumentCache = { data: null, ts: 0 };
+async function getNfoInstruments(kite) {
+  const age = Date.now() - instrumentCache.ts;
+  if (instrumentCache.data && age < 12 * 60 * 60 * 1000) return instrumentCache.data;
+  const list = await kite.getInstruments('NFO');
+  instrumentCache = { data: list, ts: Date.now() };
+  return list;
+}
+
+async function resolveTradingsymbol(kite, { name, expiry, strike, type }) {
+  const list = await getNfoInstruments(kite);
+  const targetIso = new Date(parseNseDate(expiry)).toISOString().slice(0, 10);
+  const wantedName = String(name).toUpperCase();
+  const wantedType = String(type).toUpperCase();
+  const match = list.find((i) => {
+    if ((i.name || '').toUpperCase() !== wantedName) return false;
+    if ((i.instrument_type || '').toUpperCase() !== wantedType) return false;
+    const iso = i.expiry instanceof Date ? i.expiry.toISOString().slice(0, 10) : String(i.expiry || '').slice(0, 10);
+    if (iso !== targetIso) return false;
+    return Number(i.strike) === Number(strike);
+  });
+  if (!match) throw new Error(`Instrument not found: ${wantedName} ${expiry} ${strike} ${wantedType}`);
+  return match;
+}
+
+async function placeBrokerOrder(orderReq, idempotencyKey) {
+  const db = await getDb();
+  const ordersCol = db.collection('orders');
+
+  // Idempotency check
+  if (idempotencyKey) {
+    const existing = await ordersCol.findOne({ idempotency_key: idempotencyKey });
+    if (existing) {
+      return { ok: true, duplicate: true, order_id: existing.order_id, message: 'Idempotent replay — order already submitted', existing };
+    }
+  }
+
+  const { kite } = await requireKite();
+
+  // Resolve tradingsymbol from our signal fields
+  const inst = await resolveTradingsymbol(kite, {
+    name: orderReq.symbol,
+    expiry: orderReq.expiry,
+    strike: orderReq.strike,
+    type: orderReq.type, // 'CE' | 'PE'
+  });
+
+  const qty = Number(orderReq.quantity);
+  if (!Number.isInteger(qty) || qty <= 0) throw new Error('Invalid quantity');
+  if (inst.lot_size && qty % inst.lot_size !== 0) {
+    throw new Error(`Quantity ${qty} must be a multiple of lot size ${inst.lot_size} for ${inst.tradingsymbol}`);
+  }
+
+  const params = {
+    exchange: 'NFO',
+    tradingsymbol: inst.tradingsymbol,
+    transaction_type: orderReq.side === 'SELL' ? 'SELL' : 'BUY',
+    order_type: orderReq.orderType || 'MARKET',
+    product: orderReq.product || 'MIS',
+    quantity: qty,
+    validity: 'DAY',
+  };
+  if ((orderReq.orderType || 'MARKET') === 'LIMIT') {
+    if (!orderReq.price) throw new Error('LIMIT order requires price');
+    params.price = Number(orderReq.price);
+  }
+
+  // Preflight record
+  const preflight = {
+    idempotency_key: idempotencyKey || null,
+    broker: 'kite',
+    status: 'SUBMITTING',
+    params,
+    tradingsymbol: inst.tradingsymbol,
+    signal_ref: orderReq.signal_ref || null,
+    created_at: new Date(),
+  };
+  const ins = await ordersCol.insertOne(preflight);
+
+  try {
+    const resp = await kite.placeOrder('regular', params);
+    await ordersCol.updateOne(
+      { _id: ins.insertedId },
+      { $set: { status: 'SUBMITTED', order_id: resp.order_id, broker_response: resp, submitted_at: new Date() } }
+    );
+    return { ok: true, order_id: resp.order_id, tradingsymbol: inst.tradingsymbol, params };
+  } catch (e) {
+    await ordersCol.updateOne(
+      { _id: ins.insertedId },
+      { $set: { status: 'FAILED', error: e.message, failed_at: new Date() } }
+    );
+    throw e;
+  }
+}
+
 // ------------- LLM -------------
 function getChat(sessionId, system) {
   if (!process.env.EMERGENT_LLM_KEY) throw new Error('Missing EMERGENT_LLM_KEY');
@@ -660,11 +794,121 @@ async function routeGet(request, path) {
     }
   }
 
+  // ----- BROKER: KITE -----
+  if (path === 'broker/kite/login-url') {
+    if (!KITE.API_KEY) return json({ ok: false, error: 'Kite API key not configured' }, 500);
+    const kite = newKiteClient();
+    const url = kite.getLoginURL();
+    return json({ ok: true, url });
+  }
+
+  if (path === 'broker/kite/callback') {
+    // Kite redirects here with ?request_token=...&action=login&status=success
+    const sp = new URL(request.url).searchParams;
+    const rt = sp.get('request_token');
+    const status = sp.get('status');
+    const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || '';
+    if (status !== 'success' || !rt) {
+      return NextResponse.redirect(`${baseUrl}/?broker=failed&reason=${encodeURIComponent(status || 'no_token')}`);
+    }
+    try {
+      const kite = newKiteClient();
+      const sess = await kite.generateSession(rt, KITE.API_SECRET);
+      // Persist: access_token + user info; NEVER log token
+      await saveBrokerToken('kite', {
+        access_token: sess.access_token,
+        public_token: sess.public_token,
+        user_id: sess.user_id,
+        user_name: sess.user_name,
+        user_shortname: sess.user_shortname,
+        email: sess.email,
+        broker_name: sess.broker,
+        connected_at: new Date(),
+      });
+      return NextResponse.redirect(`${baseUrl}/?broker=connected`);
+    } catch (e) {
+      return NextResponse.redirect(`${baseUrl}/?broker=failed&reason=${encodeURIComponent(e.message).slice(0, 200)}`);
+    }
+  }
+
+  if (path === 'broker/kite/status') {
+    const doc = await getBrokerToken('kite');
+    if (!doc?.access_token) return json({ ok: true, connected: false });
+    // Best effort: verify by calling getProfile (cheap)
+    try {
+      const kite = newKiteClient(doc.access_token);
+      const profile = await kite.getProfile();
+      return json({
+        ok: true, connected: true, broker: 'kite',
+        user: {
+          user_id: profile.user_id, user_name: profile.user_name,
+          email: profile.email, broker: profile.broker,
+        },
+        connected_at: doc.connected_at,
+      });
+    } catch (e) {
+      // Token likely expired (daily 6 AM IST invalidation)
+      return json({ ok: true, connected: false, reason: 'token_invalid', detail: e.message });
+    }
+  }
+
+  if (path === 'broker/kite/funds') {
+    try {
+      const { kite } = await requireKite();
+      const m = await kite.getMargins();
+      return json({ ok: true, margins: m });
+    } catch (e) { return json({ ok: false, error: e.message }, 500); }
+  }
+
+  if (path === 'broker/kite/positions') {
+    try {
+      const { kite } = await requireKite();
+      const p = await kite.getPositions();
+      return json({ ok: true, positions: p });
+    } catch (e) { return json({ ok: false, error: e.message }, 500); }
+  }
+
+  if (path === 'broker/kite/orders') {
+    try {
+      const { kite } = await requireKite();
+      const o = await kite.getOrders();
+      return json({ ok: true, orders: o });
+    } catch (e) { return json({ ok: false, error: e.message }, 500); }
+  }
+
   return json({ error: 'not_found', path }, 404);
 }
 
 async function routePost(request, path) {
   const body = await request.json().catch(() => ({}));
+
+  // ----- BROKER: KITE -----
+  if (path === 'broker/kite/disconnect') {
+    await clearBrokerToken('kite');
+    return json({ ok: true });
+  }
+
+  if (path === 'broker/kite/place-order') {
+    // Server-side validation before ANY broker call.
+    // NOTE: risk engine (daily-loss cap, position sizing) is Phase 2. This endpoint currently
+    // performs only sanity checks + broker submission. DO NOT REMOVE these checks.
+    try {
+      const { symbol, side, strike, type, expiry, quantity, orderType, price, product, idempotency_key, signal_ref } = body;
+      if (!symbol || !side || !strike || !type || !expiry || !quantity) {
+        return json({ ok: false, error: 'Missing required fields (symbol, side, strike, type, expiry, quantity)' }, 400);
+      }
+      if (!['BUY', 'SELL'].includes(side)) return json({ ok: false, error: 'side must be BUY or SELL' }, 400);
+      if (!['CE', 'PE'].includes(type)) return json({ ok: false, error: 'type must be CE or PE' }, 400);
+      const idem = idempotency_key || crypto.createHash('sha256').update(`${symbol}|${expiry}|${strike}|${type}|${side}|${quantity}|${signal_ref || ''}|${Date.now()}`).digest('hex').slice(0, 32);
+      const out = await placeBrokerOrder(
+        { symbol, side, strike, type, expiry, quantity, orderType, price, product, signal_ref },
+        idem
+      );
+      return json({ ...out, idempotency_key: idem });
+    } catch (e) {
+      return json({ ok: false, error: e.message }, 500);
+    }
+  }
 
   if (path === 'ai/analyze') {
     const symbol = (body.symbol || 'NIFTY').toUpperCase();
