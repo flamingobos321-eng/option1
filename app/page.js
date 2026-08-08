@@ -250,6 +250,30 @@ function PlaceTradeModal({ open, onOpenChange, signal, brokerConnected, onOrderP
   const [limitPrice, setLimitPrice] = useState('')
   const [busy, setBusy] = useState(false)
   const [result, setResult] = useState(null)
+  const [resolving, setResolving] = useState(false)
+  const [resolved, setResolved] = useState(null) // { tradingsymbol, lot_size, tick_size, last_price_kite }
+  const [resolveErr, setResolveErr] = useState(null)
+
+  // Resolve authoritative Kite lot size + tradingsymbol whenever modal opens
+  useEffect(() => {
+    if (!open || !signal || !brokerConnected) return
+    let alive = true
+    setResolving(true); setResolved(null); setResolveErr(null)
+    const q = new URLSearchParams({
+      symbol: signal.symbol, expiry: signal.expiry,
+      strike: String(signal.strike), type: signal.side,
+    })
+    fetch(`/api/broker/kite/resolve?${q}`, { cache: 'no-store' })
+      .then(r => r.json())
+      .then(j => {
+        if (!alive) return
+        if (j.ok) setResolved(j)
+        else setResolveErr(j.error)
+      })
+      .catch(e => { if (alive) setResolveErr(e.message) })
+      .finally(() => { if (alive) setResolving(false) })
+    return () => { alive = false }
+  }, [open, signal, brokerConnected])
 
   useEffect(() => {
     if (open) {
@@ -259,9 +283,15 @@ function PlaceTradeModal({ open, onOpenChange, signal, brokerConnected, onOrderP
   }, [open, signal])
 
   if (!signal) return null
-  const qty = lots * (signal.lotSize || 1)
-  const estCost = orderType === 'MARKET' ? Math.round(signal.ltp * qty) : Math.round(Number(limitPrice || 0) * qty)
-  const estMaxLoss = Math.round((signal.ltp - signal.stop) * qty)
+  const kiteLotSize = resolved?.lot_size || signal.lotSize || 1
+  const signalLotSize = signal.lotSize || 1
+  const qty = lots * kiteLotSize
+  const liveLtp = resolved?.last_price_kite ?? signal.ltp
+  const estCost = orderType === 'MARKET' ? Math.round(liveLtp * qty) : Math.round(Number(limitPrice || 0) * qty)
+  const estMaxLoss = Math.round((liveLtp - signal.stop) * qty)
+  const lotSizeMismatch = resolved && signalLotSize !== resolved.lot_size
+  const priceMovedPct = resolved?.last_price_kite ? ((resolved.last_price_kite - signal.ltp) / signal.ltp) * 100 : 0
+  const priceMoved = Math.abs(priceMovedPct) > 5
 
   async function submit() {
     setBusy(true)
@@ -320,14 +350,45 @@ function PlaceTradeModal({ open, onOpenChange, signal, brokerConnected, onOrderP
                 </Badge>
                 <span className="text-lg font-mono font-bold">{signal.strikeLabel}</span>
               </div>
-              <div className="text-[10px] font-mono text-slate-500">Expiry {signal.expiry} · Signal score {signal.score}/100 · LTP ₹{fmt(signal.ltp)}</div>
+              <div className="text-[10px] font-mono text-slate-500">
+                Expiry {signal.expiry} · Signal score {signal.score}/100 · Signal LTP ₹{fmt(signal.ltp)}
+                {resolved?.last_price_kite && ` · Kite LTP ₹${fmt(resolved.last_price_kite)}`}
+              </div>
+              {resolved?.tradingsymbol && (
+                <div className="text-[10px] font-mono text-emerald-400/80">
+                  Kite tradingsymbol: <span className="font-bold">{resolved.tradingsymbol}</span>
+                </div>
+              )}
+              {resolving && (
+                <div className="text-[10px] font-mono text-slate-500 flex items-center gap-1.5">
+                  <Loader2 className="w-3 h-3 animate-spin" /> Resolving contract from Kite…
+                </div>
+              )}
+              {resolveErr && (
+                <div className="text-[10px] font-mono text-rose-400 border border-rose-500/30 bg-rose-500/5 rounded px-2 py-1">
+                  ⚠ Kite resolve failed: {resolveErr}
+                </div>
+              )}
             </div>
+
+            {lotSizeMismatch && (
+              <div className="border border-amber-500/40 bg-amber-500/10 rounded p-2 text-xs text-amber-300 font-mono">
+                ⚠ Lot size updated from Kite: <span className="line-through text-slate-500">{signalLotSize}</span> → <span className="font-bold text-amber-200">{resolved.lot_size}</span> (SEBI/NSE per-series adjustment). Quantity below now uses <span className="font-bold">{resolved.lot_size}</span>/lot.
+              </div>
+            )}
+            {priceMoved && (
+              <div className="border border-amber-500/40 bg-amber-500/10 rounded p-2 text-xs text-amber-300 font-mono">
+                ⚠ Price moved {priceMovedPct >= 0 ? '+' : ''}{fmt(priceMovedPct, 1)}% since signal · Signal ₹{fmt(signal.ltp)} → Kite ₹{fmt(resolved.last_price_kite)}. Reconsider entry.
+              </div>
+            )}
 
             <div className="grid grid-cols-2 gap-3">
               <div>
                 <label className="text-[10px] uppercase tracking-widest text-slate-500">Lots</label>
-                <Input type="number" min={1} max={20} value={lots} onChange={e => setLots(Math.max(1, +e.target.value || 1))} className="bg-slate-900 border-slate-800 text-slate-100 h-9 font-mono" />
-                <div className="text-[10px] font-mono text-slate-500 mt-1">= {qty} qty (lot size {signal.lotSize})</div>
+                <Input type="number" min={1} max={20} value={lots} onChange={e => setLots(Math.max(1, +e.target.value || 1))} className="bg-slate-900 border-slate-800 text-slate-100 h-9 font-mono" disabled={resolving} />
+                <div className="text-[10px] font-mono text-slate-500 mt-1">
+                  = {qty} qty ({resolved ? <span className="text-emerald-400">Kite lot {resolved.lot_size}</span> : `signal lot ${signalLotSize}`})
+                </div>
               </div>
               <div>
                 <label className="text-[10px] uppercase tracking-widest text-slate-500">Order Type</label>
@@ -342,8 +403,8 @@ function PlaceTradeModal({ open, onOpenChange, signal, brokerConnected, onOrderP
               {orderType === 'LIMIT' && (
                 <div>
                   <label className="text-[10px] uppercase tracking-widest text-slate-500">Limit Price ₹</label>
-                  <Input type="number" step="0.05" value={limitPrice} onChange={e => setLimitPrice(e.target.value)} className="bg-slate-900 border-slate-800 text-slate-100 h-9 font-mono" />
-                  <div className="text-[10px] font-mono text-slate-500 mt-1">signal entry zone ₹{fmt(signal.entry.low, 1)}–{fmt(signal.entry.high, 1)}</div>
+                  <Input type="number" step={resolved?.tick_size || 0.05} value={limitPrice} onChange={e => setLimitPrice(e.target.value)} className="bg-slate-900 border-slate-800 text-slate-100 h-9 font-mono" />
+                  <div className="text-[10px] font-mono text-slate-500 mt-1">tick {resolved?.tick_size ?? 0.05} · entry ₹{fmt(signal.entry.low, 1)}–{fmt(signal.entry.high, 1)}</div>
                 </div>
               )}
               <div>
@@ -362,7 +423,7 @@ function PlaceTradeModal({ open, onOpenChange, signal, brokerConnected, onOrderP
             <div className="border border-rose-500/20 bg-rose-500/5 rounded p-3 space-y-1.5 font-mono text-xs">
               <div className="flex justify-between"><span className="text-slate-500">Estimated cost</span><span className="text-slate-200">≈ ₹{compact(estCost)}</span></div>
               <div className="flex justify-between"><span className="text-slate-500">Max loss if stopped out</span><span className="text-rose-300">≈ ₹{compact(estMaxLoss)}</span></div>
-              <div className="flex justify-between"><span className="text-slate-500">Target 1 (potential gain)</span><span className="text-emerald-300">≈ ₹{compact((signal.target1 - signal.ltp) * qty)}</span></div>
+              <div className="flex justify-between"><span className="text-slate-500">Target 1 (potential gain)</span><span className="text-emerald-300">≈ ₹{compact((signal.target1 - liveLtp) * qty)}</span></div>
               <div className="flex justify-between"><span className="text-slate-500">Invalidation</span><span className="text-amber-300 text-right">{signal.invalidation}</span></div>
             </div>
 
@@ -384,8 +445,11 @@ function PlaceTradeModal({ open, onOpenChange, signal, brokerConnected, onOrderP
             {result?.ok ? 'Close' : 'Cancel'}
           </Button>
           {brokerConnected && !result?.ok && (
-            <Button onClick={submit} disabled={busy} className="bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold">
-              {busy ? <><Loader2 className="w-3.5 h-3.5 animate-spin mr-1.5" /> Placing…</> : <>CONFIRM ORDER · {lots} lot{lots > 1 ? 's' : ''}</>}
+            <Button onClick={submit} disabled={busy || resolving || !resolved} className="bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold">
+              {busy ? <><Loader2 className="w-3.5 h-3.5 animate-spin mr-1.5" /> Placing…</> :
+                resolving ? <><Loader2 className="w-3.5 h-3.5 animate-spin mr-1.5" /> Resolving…</> :
+                !resolved ? <>Waiting for Kite…</> :
+                <>CONFIRM ORDER · {lots} lot{lots > 1 ? 's' : ''} = {qty} qty</>}
             </Button>
           )}
         </DialogFooter>

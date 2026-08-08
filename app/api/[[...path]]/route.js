@@ -222,7 +222,10 @@ async function getOptionChain(symbol) {
 }
 
 // ------------- SIGNAL ENGINE (deterministic) -------------
-const LOT_SIZES = { NIFTY: 75, BANKNIFTY: 15, FINNIFTY: 40 };
+// Fallback lot sizes for display before Kite instrument lookup runs.
+// Actual lot size used for order placement is ALWAYS pulled from Kite's instruments dump
+// (SEBI/NSE change lot sizes per series — do NOT trust these hardcoded values for orders).
+const LOT_SIZES = { NIFTY: 65, BANKNIFTY: 35, FINNIFTY: 65 };
 const INDEX_TICK_KEY = { NIFTY: 'NIFTY 50', BANKNIFTY: 'NIFTY BANK', FINNIFTY: 'NIFTY FIN SERVICE' };
 
 function inferStep(rows) {
@@ -873,6 +876,36 @@ async function routeGet(request, path) {
       const { kite } = await requireKite();
       const o = await kite.getOrders();
       return json({ ok: true, orders: o });
+    } catch (e) { return json({ ok: false, error: e.message }, 500); }
+  }
+
+  if (path === 'broker/kite/resolve') {
+    // Look up the AUTHORITATIVE Kite tradingsymbol + lot_size for a given contract.
+    // Prevents lot-size mismatch errors (SEBI/NSE change lot sizes per series).
+    try {
+      const sp = new URL(request.url).searchParams;
+      const symbol = sp.get('symbol');
+      const expiry = sp.get('expiry');
+      const strike = sp.get('strike');
+      const type = sp.get('type');
+      if (!symbol || !expiry || !strike || !type) return json({ ok: false, error: 'symbol, expiry, strike, type required' }, 400);
+      const { kite } = await requireKite();
+      const inst = await resolveTradingsymbol(kite, { name: symbol, expiry, strike: Number(strike), type });
+      // Also fetch live LTP from Kite for a fresher quote than NSE cached
+      let ltp = null;
+      try {
+        const q = await kite.getLTP([`NFO:${inst.tradingsymbol}`]);
+        ltp = q?.[`NFO:${inst.tradingsymbol}`]?.last_price ?? null;
+      } catch (_) { /* non-fatal */ }
+      return json({
+        ok: true,
+        tradingsymbol: inst.tradingsymbol,
+        lot_size: inst.lot_size,
+        tick_size: inst.tick_size,
+        instrument_token: inst.instrument_token,
+        expiry: inst.expiry,
+        last_price_kite: ltp,
+      });
     } catch (e) { return json({ ok: false, error: e.message }, 500); }
   }
 
